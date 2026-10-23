@@ -310,6 +310,29 @@ def fmt_track(track: dict) -> str:
     )
 
 
+def cmd_search(args: argparse.Namespace) -> None:
+    api = Api()
+    payload = api.get(
+        "/search",
+        text=args.query,
+        type="all",
+        page=0,
+        **{"page-size": args.limit},
+        nocorrect="true",
+    )
+    result = payload.get("result") or {}
+    tracks = ((result.get("tracks") or {}).get("results")) or []
+    if not tracks:
+        best = (result.get("best") or {}).get("result")
+        if isinstance(best, dict) and best.get("id"):
+            print(fmt_track(best))
+            return
+        print("Ничего не найдено.")
+        return
+    for track in tracks[: args.limit]:
+        print(fmt_track(track))
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     api = Api()
     require_token(api, "статус")
@@ -346,6 +369,140 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# streaming
+# ---------------------------------------------------------------------------
+
+
+def resolve_stream(api: Api, track_id: str) -> tuple[str, dict]:
+    """Возвращает (url_mp3, download_info_item)."""
+    info = api.get(f"/tracks/{track_id}/download-info")
+    items = info.get("result") or []
+    if not items:
+        die(f"для трека {track_id} нет download-info (возможно, недоступен)")
+
+    # Лучший вариант: не preview и максимальный битрейт.
+    items.sort(
+        key=lambda item: (not item.get("preview", False), item.get("bitrateInKbps", 0)),
+        reverse=True,
+    )
+    item = items[0]
+
+    download_url = item["downloadInfoUrl"]
+    parsed = urllib.parse.urlparse(download_url)
+    query = parsed.query + ("&" if parsed.query else "") + "format=json"
+
+    meta = api.get_url(f"{YANDEX_BASE}{parsed.path}?{query}")
+    path = meta["path"]
+    signature = meta["s"]
+    host = meta["host"]
+    timestamp = meta["ts"]
+
+    digest = hashlib.md5((STREAM_SIGN_SECRET + path + signature).encode()).hexdigest()
+    stream_url = f"https://{host}/get-mp3/{digest}/{timestamp}{path}"
+    return stream_url, item
+
+
+def cmd_url(args: argparse.Namespace) -> None:
+    api = Api()
+    url, item = resolve_stream(api, args.track_id)
+    if item.get("preview"):
+        print("# preview: полный трек недоступен без активной подписки", file=sys.stderr)
+    print(url)
+
+
+def pick_player(explicit: str | None) -> str | None:
+    if explicit:
+        return explicit
+    for candidate in ("mpv", "ffplay"):
+        path = shutil.which(candidate)
+        if path:
+            return path
+    return None
+
+
+def print_track_info(api: Api, track_id: str) -> None:
+    try:
+        track = api.get(f"/tracks/{track_id}")["result"][0]
+    except (SystemExit, KeyError, IndexError):
+        return
+    print(fmt_track(track), file=sys.stderr)
+
+
+def play_url(player: str, url: str) -> None:
+    name = Path(player).name
+    if name == "ffplay":
+        command = [player, "-nodisp", "-autoexit", "-loglevel", "warning", url]
+    else:
+        command = [player, "--no-video", "--really-quiet", url]
+    try:
+        subprocess.run(command, check=False)
+    except KeyboardInterrupt:
+        raise
+
+
+def play_items(api: Api, tracks: list[dict], explicit_player: str | None = None) -> None:
+    player = pick_player(explicit_player)
+    if not player:
+        die("не найден mpv/ffplay. Установи один из них или используй: mtsmusic.py url <id>")
+
+    for index, track in enumerate(tracks, 1):
+        track_id = str(track.get("id"))
+        print(f"\n▶ {index}/{len(tracks)}  {fmt_track(track)}", file=sys.stderr)
+        try:
+            url, item = resolve_stream(api, track_id)
+        except SystemExit:
+            print("  пропускаю: не удалось получить поток", file=sys.stderr)
+            continue
+        if item.get("preview"):
+            print("  внимание: preview-фрагмент", file=sys.stderr)
+        try:
+            play_url(player, url)
+        except KeyboardInterrupt:
+            print("\nОстановлено.", file=sys.stderr)
+            return
+
+
+def cmd_play(args: argparse.Namespace) -> None:
+    api = Api()
+    print_track_info(api, args.track_id)
+    url, item = resolve_stream(api, args.track_id)
+    if item.get("preview"):
+        print("Внимание: это preview-фрагмент (нет активной подписки).", file=sys.stderr)
+
+    player = pick_player(args.player)
+    if not player:
+        die("не найден mpv/ffplay. Установи один из них или используй: mtsmusic.py url <id>")
+
+    try:
+        play_url(player, url)
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_download(args: argparse.Namespace) -> None:
+    api = Api()
+    print_track_info(api, args.track_id)
+    url, _ = resolve_stream(api, args.track_id)
+    force_ipv4()
+    output = Path(args.output or f"{args.track_id}.mp3")
+
+    with requests.get(url, stream=True, headers={"User-Agent": USER_AGENT}, timeout=60) as response:
+        response.raise_for_status()
+        total = int(response.headers.get("Content-Length") or 0)
+        done = 0
+        with output.open("wb") as handle:
+            for chunk in response.iter_content(chunk_size=256 * 1024):
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                done += len(chunk)
+                if total:
+                    print(f"\r{done * 100 // total:3d}%  {done // 1024} KiB", end="", file=sys.stderr)
+        print(file=sys.stderr)
+    print(f"Сохранено: {output} ({output.stat().st_size} байт)")
+
+
+# ---------------------------------------------------------------------------
 # cli
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -361,6 +518,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="показать аккаунт и подписку")
     status.set_defaults(func=cmd_status)
+
+    search = sub.add_parser("search", help="поиск треков")
+    search.add_argument("query", help="поисковый запрос")
+    search.add_argument("-n", "--limit", type=int, default=10, help="сколько результатов (по умолчанию 10)")
+    search.set_defaults(func=cmd_search)
+
+    url = sub.add_parser("url", help="получить прямую ссылку на MP3")
+    url.add_argument("track_id")
+    url.set_defaults(func=cmd_url)
+
+    play = sub.add_parser("play", help="воспроизвести трек через mpv/ffplay")
+    play.add_argument("track_id")
+    play.add_argument("--player", help="путь к mpv/ffplay")
+    play.set_defaults(func=cmd_play)
+
+    download = sub.add_parser("download", help="скачать трек в MP3")
+    download.add_argument("track_id")
+    download.add_argument("-o", "--output", help="имя файла")
+    download.set_defaults(func=cmd_download)
 
     return parser
 
