@@ -1,6 +1,7 @@
 # MTS Music CLI
 
-Минимальный клиент для **своего** аккаунта MTS Music.
+Минимальный клиент для **своего** аккаунта MTS Music: вход, статус аккаунта
+и проверка подписки.
 
 Внутри используется тот же путь, что и в веб-клиенте: MTS SSO выдаёт
 OAuth-токен Яндекс.Музыки, дальше запросы идут на `api.music.yandex.net`.
@@ -17,3 +18,20 @@ PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright" .venv/bin/playwright install chromiu
 - `.venv/` — зависимости
 - `.playwright/` — браузер Chromium
 - `.mts-music/` — профиль браузера и `credentials.json`
+
+## Вход
+
+```bash
+.venv/bin/python mtsmusic.py login
+```
+
+Откроется браузер. Нужно вручную войти в MTS и пройти капчу. Токен и cookie
+сохранятся в `.mts-music/credentials.json` с правами `600`.
+Повторный вход нужен только когда токен перестанет работать.
+
+## Команды
+
+```bash
+# кто я и есть ли подписка
+.venv/bin/python mtsmusic.py status
+```
