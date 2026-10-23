@@ -797,6 +797,14 @@ def cmd_download(args: argparse.Namespace) -> None:
 
 # ---------------------------------------------------------------------------
 # cli
+def cmd_tui(args: argparse.Namespace) -> None:
+    try:
+        from tui import MusicTui
+    except ImportError as exc:
+        die(f"для TUI нужен textual и pillow: {exc}. Установи: pip install -r requirements.txt")
+    MusicTui(player=args.player).run()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mtsmusic",
@@ -847,6 +855,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="не использовать LRCLIB, если MTS не отдал текст",
     )
     lyrics.set_defaults(func=cmd_lyrics)
+
+    tui = sub.add_parser("tui", help="полноценный TUI-плеер (мышь, обложка, избранное)")
+    tui.add_argument("--player", help="путь к mpv/ffplay")
+    tui.set_defaults(func=cmd_tui)
 
     url = sub.add_parser("url", help="получить прямую ссылку на MP3")
     url.add_argument("track_id")

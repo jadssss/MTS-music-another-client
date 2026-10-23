@@ -1,2 +1,4 @@
 playwright>=1.40
 requests>=2.31
+textual>=0.80
+pillow>=10
