@@ -36,6 +36,7 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QAbstractButton,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -111,6 +112,11 @@ QSlider::handle:horizontal:hover { background: #ffd9df; }
 }
 #actionBtn:hover { background: rgba(255,255,255,0.09); }
 #actionBtn[liked="true"] { color: #ff8296; border-color: rgba(255,59,92,0.40); }
+#menuBtn:focus, #prevBtn:focus, #nextBtn:focus, #playBtn:focus,
+#actionBtn:focus, #backBtn:focus, #searchBtn:focus {
+    border: 2px solid #ffffff;
+}
+QSlider:focus { border: 1px solid #ffffff; border-radius: 4px; }
 #drawer { background: #16161f; border-right: 1px solid rgba(255,255,255,0.06); }
 #drawerTitle { font-size: 18px; font-weight: 700; padding: 4px 2px 10px 2px; }
 #drawerBrand { color: #6f6f82; font-size: 11px; padding: 0 2px 12px 2px; }
@@ -216,11 +222,21 @@ class Task(QRunnable):
         try:
             result = self.fn()
         except SystemExit as exc:
-            self.signals.failed.emit(self, str(exc) or "ошибка")
+            self._emit_failed(str(exc) or "ошибка")
         except Exception as exc:  # noqa: BLE001 - сообщение показываем в UI
-            self.signals.failed.emit(self, str(exc) or exc.__class__.__name__)
+            self._emit_failed(str(exc) or exc.__class__.__name__)
         else:
-            self.signals.done.emit(self, result)
+            try:
+                self.signals.done.emit(self, result)
+            except RuntimeError:
+                # Приложение уже закрылось, сигнал отправлять некуда.
+                pass
+
+    def _emit_failed(self, message: str) -> None:
+        try:
+            self.signals.failed.emit(self, message)
+        except RuntimeError:
+            pass
 
 
 class CoverView(QWidget):
@@ -276,6 +292,43 @@ class CoverView(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 20, 20)
         painter.end()
+
+
+class ClickSlider(QSlider):
+    """Перематывает по клику в любую точку полосы, а не шагами."""
+
+    seekRequested = Signal(int)
+    scrubStarted = Signal()
+    scrubFinished = Signal()
+
+    def _value_at(self, x: int) -> int:
+        return QStyle.sliderValueFromPosition(
+            self.minimum(), self.maximum(), x, max(1, self.width())
+        )
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and self.maximum() > 0:
+            self.scrubStarted.emit()
+            value = self._value_at(event.position().toPoint().x())
+            self.setValue(value)
+            self.seekRequested.emit(value)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if event.buttons() & Qt.MouseButton.LeftButton and self.maximum() > 0:
+            value = self._value_at(event.position().toPoint().x())
+            self.setValue(value)
+            self.seekRequested.emit(value)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.scrubFinished.emit()
+        super().mouseReleaseEvent(event)
 
 
 class TrackDelegate(QStyledItemDelegate):
@@ -394,6 +447,8 @@ class QtMusicApp(QMainWindow):
         self._build_ui()
         self._build_drawer()
         self._build_toast()
+        self._update_cover_size()
+        self.play_btn.setFocus()
 
         self._timer = QTimer(self)
         self._timer.setInterval(500)
@@ -468,6 +523,32 @@ class QtMusicApp(QMainWindow):
         )
         self.pages.addWidget(self.lyrics_page)
 
+        self._setup_tab_order()
+
+    def _setup_tab_order(self) -> None:
+        """Явный порядок обхода по Tab для главного экрана."""
+        for widget in (
+            self.menu_btn,
+            self.slider,
+            self.prev_btn,
+            self.play_btn,
+            self.next_btn,
+            self.lyrics_btn,
+            self.like_btn,
+        ):
+            widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        order = [
+            self.menu_btn,
+            self.slider,
+            self.prev_btn,
+            self.play_btn,
+            self.next_btn,
+            self.lyrics_btn,
+            self.like_btn,
+        ]
+        for first, second in zip(order, order[1:]):
+            self.setTabOrder(first, second)
+
     def _build_main_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -480,7 +561,9 @@ class QtMusicApp(QMainWindow):
         menu.setObjectName("menuBtn")
         menu.setText("☰")
         menu.setCursor(Qt.CursorShape.PointingHandCursor)
+        menu.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         menu.clicked.connect(self.open_drawer)
+        self.menu_btn = menu
         brand = QLabel("MTS Music")
         brand.setObjectName("brand")
         self.top_status = QLabel("")
@@ -496,7 +579,7 @@ class QtMusicApp(QMainWindow):
 
         layout.addStretch(1)
         self.cover = CoverView()
-        self.cover.setFixedSize(288, 288)
+        self.cover.setFixedSize(330, 330)
         layout.addWidget(self.cover, 0, Qt.AlignmentFlag.AlignHCenter)
         layout.addSpacing(16)
 
@@ -518,11 +601,12 @@ class QtMusicApp(QMainWindow):
         layout.addWidget(self.album_label)
         layout.addSpacing(14)
 
-        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider = ClickSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 0)
-        self.slider.sliderPressed.connect(self.slider_pressed)
-        self.slider.sliderReleased.connect(self.slider_released)
-        self.slider.sliderMoved.connect(self.slider_moved)
+        self.slider.seekRequested.connect(self.on_slider_seek)
+        self.slider.actionTriggered.connect(self.on_slider_action)
+        self.slider.scrubStarted.connect(lambda: setattr(self, "_seeking", True))
+        self.slider.scrubFinished.connect(lambda: setattr(self, "_seeking", False))
         layout.addWidget(self.slider)
         layout.addSpacing(3)
 
@@ -590,10 +674,6 @@ class QtMusicApp(QMainWindow):
         layout.addLayout(actions)
 
         layout.addStretch(1)
-        self.queue_label = QLabel("")
-        self.queue_label.setObjectName("queueLabel")
-        self.queue_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.queue_label)
         return page
 
     def _page_header(self, title: str) -> QHBoxLayout:
@@ -745,8 +825,21 @@ class QtMusicApp(QMainWindow):
         else:
             self.drawer.setGeometry(-width, 0, width, height)
         self.scrim.setGeometry(0, 0, central.width(), height)
+        self._update_cover_size()
         if self.toast_label.isVisible():
             self._place_toast()
+
+    def _update_cover_size(self) -> None:
+        """Обложка — насколько позволяет окно, но не мельче разумного."""
+        central = self.centralWidget()
+        side = min(
+            central.width() - 64,
+            int(central.height() * 0.46),
+            380,
+        )
+        side = max(240, side)
+        if self.cover.width() != side:
+            self.cover.setFixedSize(side, side)
 
     def _place_toast(self) -> None:
         central = self.centralWidget()
@@ -833,7 +926,9 @@ class QtMusicApp(QMainWindow):
     def _fetch_initial(self) -> tuple[str, list[dict], set[str]]:
         api = self.api
         uid = self.uid or get_uid(api)
-        batch = fetch_mix_batch(api)
+        # Продолжаем волну с последних прослушанных треков, а не с начала.
+        seed = [str(track.get("id")) for track in self.history[:5]]
+        batch = fetch_mix_batch(api, seed or None)
         wave = [
             item["track"]
             for item in (batch.get("sequence") or [])
@@ -874,11 +969,6 @@ class QtMusicApp(QMainWindow):
         self.duration_label.setText(fmt_millis(duration))
         self.update_like_button()
         self.update_play_button()
-        total = len(self.queue)
-        position = self.current_index + 1 if self.current_index >= 0 else 0
-        self.queue_label.setText(
-            f"{self.queue_name} · {position}/{total}" if total else self.queue_name
-        )
 
     def update_like_button(self, liked: bool | None = None) -> None:
         if liked is None:
@@ -1026,16 +1116,17 @@ class QtMusicApp(QMainWindow):
             return
         self.toast(message or "Не удалось воспроизвести трек")
 
-    def slider_pressed(self) -> None:
-        self._seeking = True
-
-    def slider_moved(self, value: int) -> None:
+    def on_slider_seek(self, value: int) -> None:
+        self._seeking = False
+        self.player.setPosition(value)
         self.elapsed_label.setText(fmt_millis(value))
 
-    def slider_released(self) -> None:
-        self._seeking = False
-        self.player.setPosition(self.slider.value())
-        self.elapsed_label.setText(fmt_millis(self.slider.value()))
+    def on_slider_action(self, action: int) -> None:
+        # Колесо и стрелки, когда слайдер в фокусе (клик обрабатывает ClickSlider).
+        if self.slider.maximum() > 0:
+            value = self.slider.value()
+            self.player.setPosition(value)
+            self.elapsed_label.setText(fmt_millis(value))
 
     def seek(self, delta_ms: int) -> None:
         if self.player.source().isEmpty():
@@ -1329,6 +1420,24 @@ class QtMusicApp(QMainWindow):
             return
 
         key = event.key()
+        if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+            super().keyPressEvent(event)
+            return
+        if isinstance(focus, QAbstractButton) and key in (
+            Qt.Key.Key_Space,
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+        ):
+            super().keyPressEvent(event)
+            return
+        if isinstance(focus, QSlider) and key in (
+            Qt.Key.Key_Left,
+            Qt.Key.Key_Right,
+            Qt.Key.Key_Up,
+            Qt.Key.Key_Down,
+        ):
+            super().keyPressEvent(event)
+            return
         if key == Qt.Key.Key_Escape:
             if self._drawer_open:
                 self.close_drawer()

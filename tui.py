@@ -65,8 +65,8 @@ MONO_THEME = Theme(
 
 
 def cover_renderable(data: bytes, width: int) -> Text:
-    """Обложка в оттенках серого (полностью чёрно-белый интерфейс)."""
-    image = Image.open(io.BytesIO(data)).convert("L")
+    """Цветная обложка, интерфейс вокруг остаётся чёрно-белым."""
+    image = Image.open(io.BytesIO(data)).convert("RGB")
     rows = max(1, width // 2)
     image = image.resize((width, rows * 2), Image.Resampling.LANCZOS)
 
@@ -77,8 +77,8 @@ def cover_renderable(data: bytes, width: int) -> Text:
             bottom = image.getpixel((x, y * 2 + 1))
             canvas.append(
                 "▀",
-                style=f"#{top:02x}{top:02x}{top:02x} "
-                f"on #{bottom:02x}{bottom:02x}{bottom:02x}",
+                style=f"#{top[0]:02x}{top[1]:02x}{top[2]:02x} "
+                f"on #{bottom[0]:02x}{bottom[1]:02x}{bottom[2]:02x}",
             )
         if y != rows - 1:
             canvas.append("\n")
@@ -598,7 +598,9 @@ class MusicTui(App):
             self.uid = get_uid(api)
             from mtsmusic import fetch_mix_batch
 
-            batch = fetch_mix_batch(api)
+            # Продолжаем волну с последних прослушанных треков, а не с начала.
+            seed = [str(track.get("id")) for track in self.history[:5]]
+            batch = fetch_mix_batch(api, seed or None)
             wave = [
                 item["track"]
                 for item in (batch.get("sequence") or [])
