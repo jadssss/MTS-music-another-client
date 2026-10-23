@@ -830,6 +830,17 @@ def cmd_tui(args: argparse.Namespace) -> None:
         die(f"TUI упал: {exc}. Подробности: {log}")
 
 
+def cmd_qt(args: argparse.Namespace) -> None:
+    try:
+        from qt_app import main as qt_main
+    except ImportError as exc:
+        die(
+            "для Qt-приложения нужен PySide6: "
+            f"{exc}. Установи: pip install -r requirements-qt.txt"
+        )
+    raise SystemExit(qt_main())
+
+
 def print_tui_check() -> None:
     import platform
 
@@ -921,6 +932,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tui.add_argument("--no-mouse", action="store_true", help="отключить поддержку мыши")
     tui.set_defaults(func=cmd_tui)
+
+    qt = sub.add_parser("qt", help="настольное Qt-приложение (PySide6)")
+    qt.set_defaults(func=cmd_qt)
 
     url = sub.add_parser("url", help="получить прямую ссылку на MP3")
     url.add_argument("track_id")
