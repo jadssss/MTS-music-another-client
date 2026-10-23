@@ -369,6 +369,299 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# моя волна, избранное, тексты
+# ---------------------------------------------------------------------------
+
+
+def get_uid(api: Api) -> str:
+    uid = (load_credentials() or {}).get("ya_uid")
+    if uid:
+        return str(uid)
+    # Резервный путь: uid есть в ответе MTS-статуса.
+    result = api.get("/account/mts/status").get("result") or {}
+    uid = (result.get("account") or {}).get("uid")
+    if not uid:
+        die("не удалось определить uid аккаунта. Выполни: python mtsmusic.py login")
+    creds = load_credentials() or {}
+    creds["ya_uid"] = str(uid)
+    save_credentials(creds)
+    return str(uid)
+
+
+def get_track(api: Api, track_id: str) -> dict:
+    result = api.get(f"/tracks/{track_id}").get("result") or []
+    if not result:
+        die(f"трек {track_id} не найден")
+    return result[0]
+
+
+def album_id(track: dict) -> str | None:
+    albums = track.get("albums") or []
+    if albums:
+        return str(albums[0].get("id"))
+    return None
+
+
+def track_album_ref(track_id: str, album: str | None = None) -> str:
+    return f"{track_id}:{album}" if album else str(track_id)
+
+
+def fetch_mix_batch(api: Api, queue: list[str] | None = None) -> dict:
+    params = {"queue": ",".join(queue)} if queue else {}
+    return api.get(f"/rotor/station/{WAVE_STATION}/tracks", **params).get("result") or {}
+
+
+def print_mix_item(index: int, item: dict) -> None:
+    track = item.get("track") or {}
+    heart = "♥" if item.get("liked") else " "
+    print(f"{heart} {index:>3}. {fmt_track(track)}", flush=True)
+
+
+def cmd_mix(args: argparse.Namespace) -> None:
+    api = Api()
+    require_token(api, "моя волна")
+
+    limit = max(1, args.number)
+    collected: list[dict] = []
+    seen: set[str] = set()
+    queue: list[str] | None = None
+    attempts = 0
+    max_attempts = max(10, limit)
+
+    print(f"Моя волна — {limit} трек(ов):", file=sys.stderr)
+    while len(collected) < limit and attempts < max_attempts:
+        attempts += 1
+        result = fetch_mix_batch(api, queue)
+        sequence = result.get("sequence") or []
+        if not sequence:
+            break
+
+        new_items = []
+        for item in sequence:
+            if item.get("type") != "track":
+                continue
+            track_id = str((item.get("track") or {}).get("id") or "")
+            if not track_id or track_id in seen:
+                continue
+            seen.add(track_id)
+            new_items.append(item)
+
+        if not new_items:
+            break
+
+        for item in new_items:
+            if len(collected) >= limit:
+                break
+            collected.append(item)
+
+        ids = [str((item.get("track") or {}).get("id")) for item in sequence]
+        queue = ids[-5:]
+
+    if not collected:
+        die("волна вернула пустой список")
+
+    for index, item in enumerate(collected, 1):
+        print_mix_item(index, item)
+
+    if args.play:
+        play_items(api, [item.get("track") or {} for item in collected], args.player)
+
+
+def cmd_like(args: argparse.Namespace) -> None:
+    api = Api()
+    require_token(api, "избранное")
+    uid = get_uid(api)
+    track = get_track(api, args.track_id)
+    album = args.album or album_id(track)
+    ref = track_album_ref(args.track_id, album)
+    api.post(f"/users/{uid}/likes/tracks/add", **{"track-id": ref})
+    print(f"♥ добавлено в избранное: {fmt_track(track)}")
+
+
+def cmd_unlike(args: argparse.Namespace) -> None:
+    api = Api()
+    require_token(api, "избранное")
+    uid = get_uid(api)
+    track = get_track(api, args.track_id)
+    album = args.album or album_id(track)
+    ref = track_album_ref(args.track_id, album)
+    api.post(f"/users/{uid}/likes/tracks/remove", **{"track-ids": ref})
+    print(f"♡ убрано из избранного: {fmt_track(track)}")
+
+
+def cmd_likes(args: argparse.Namespace) -> None:
+    api = Api()
+    require_token(api, "избранное")
+    uid = get_uid(api)
+    payload = api.get(f"/users/{uid}/likes/tracks")
+    library = (payload.get("result") or {}).get("library") or {}
+    liked = library.get("tracks") or []
+    if not liked:
+        print("В избранном пока пусто.")
+        return
+
+    limit = max(1, args.number)
+    liked = liked[:limit]
+    refs = ",".join(str(item.get("id")) for item in liked)
+
+    details: dict[str, dict] = {}
+    # /tracks отдаёт не больше сотни id за раз — бьём на порции.
+    ids = [str(item.get("id")) for item in liked]
+    for start in range(0, len(ids), 50):
+        chunk = ids[start : start + 50]
+        try:
+            tracks = api.get("/tracks", trackIds=",".join(chunk)).get("result") or []
+        except SystemExit:
+            tracks = []
+        for track in tracks:
+            details[str(track.get("id"))] = track
+
+    for index, item in enumerate(liked, 1):
+        track_id = str(item.get("id"))
+        track = details.get(track_id)
+        if track:
+            print(f"{index:>3}. {fmt_track(track)}")
+        else:
+            album = item.get("albumId")
+            print(f"{index:>3}. {track_id:>12}  (альбом {album})")
+
+
+def lyrics_response(api: Api, track_id: str, fmt: str = "TEXT") -> requests.Response:
+    """Запрос текста с подписью из веб-клиента MTS."""
+    timestamp = int(time.time())
+    message = f"{track_id}{timestamp}"
+    signature = base64.b64encode(
+        hmac.new(LYRICS_SIGN_KEY.encode(), message.encode(), hashlib.sha256).digest()
+    ).decode()
+
+    force_ipv4()
+    return api.session.get(
+        f"{YANDEX_BASE}/tracks/{track_id}/lyrics",
+        params={"timeStamp": timestamp, "sign": signature, "format": fmt},
+        headers=api._headers(),
+        timeout=30,
+    )
+
+
+def lyrics_text(api: Api, response: requests.Response) -> str:
+    """Достаёт сам текст: API отдаёт ссылку на файл, а не строки."""
+    payload = response.json()
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if isinstance(result, str):
+        return result
+    if not isinstance(result, dict):
+        return ""
+
+    for key in ("lyrics", "full_lyrics", "fullLyrics", "text"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+
+    download_url = result.get("download_url") or result.get("downloadUrl")
+    if download_url:
+        force_ipv4()
+        file_response = requests.get(
+            download_url, headers={"User-Agent": USER_AGENT}, timeout=60
+        )
+        file_response.raise_for_status()
+        return file_response.text
+    return ""
+
+
+LRCLIB_URL = "https://lrclib.net/api/search"
+
+
+def lrclib_lyrics(track: dict, want_sync: bool) -> str | None:
+    """Резервный источник текста: LRCLIB (бесплатный API, без ключа)."""
+    title = (track.get("title") or "").strip()
+    artists = track.get("artists") or []
+    artist = (artists[0].get("name") or "").strip() if artists else ""
+    if not title:
+        return None
+
+    force_ipv4()
+    headers = {"User-Agent": "MTSMusicCLI/0.1 (personal use)"}
+    queries = [
+        {"track_name": title, "artist_name": artist},
+        {"q": f"{artist} {title}".strip()},
+    ]
+    candidates: list[dict] = []
+    for params in queries:
+        try:
+            response = requests.get(LRCLIB_URL, params=params, headers=headers, timeout=20)
+        except requests.RequestException:
+            continue
+        if response.status_code != 200:
+            continue
+        try:
+            data = response.json()
+        except ValueError:
+            continue
+        if isinstance(data, list) and data:
+            candidates = data
+            break
+    if not candidates:
+        return None
+
+    # Выбираем версию, ближайшую по длительности, где есть нужный формат.
+    field = "syncedLyrics" if want_sync else "plainLyrics"
+    duration = (track.get("durationMs") or 0) / 1000
+
+    def score(item: dict) -> float:
+        diff = abs(float(item.get("duration") or 0) - duration) if duration else 0
+        exact = 0 if (item.get("trackName") or "").casefold() == title.casefold() else 50
+        return diff + exact
+
+    usable = [item for item in candidates if (item.get(field) or "").strip()]
+    if not usable and want_sync:
+        usable = [item for item in candidates if (item.get("plainLyrics") or "").strip()]
+        field = "plainLyrics"
+    if not usable:
+        return None
+    best = min(usable, key=score)
+    return (best.get(field) or "").strip() or None
+
+
+def cmd_lyrics(args: argparse.Namespace) -> None:
+    api = Api()
+    require_token(api, "текст песни")
+    track = get_track(api, args.track_id)
+    fmt = "LRC" if args.lrc else "TEXT"
+
+    text = ""
+    source = "MTS"
+    response = lyrics_response(api, args.track_id, fmt)
+    if response.status_code == 200:
+        try:
+            text = lyrics_text(api, response)
+        except (ValueError, requests.RequestException):
+            text = ""
+        if "Подключите подписку" in text:
+            text = ""
+    elif response.status_code not in (403, 404):
+        die(f"HTTP {response.status_code}: {response.text[:300]}")
+
+    if not text.strip() and not args.no_fallback:
+        text = lrclib_lyrics(track, want_sync=args.lrc) or ""
+        source = "LRCLIB"
+
+    if not text.strip():
+        print(f"Текст не найден: {fmt_track(track)}")
+        return
+
+    if args.output:
+        output = Path(args.output)
+        output.write_text(text, encoding="utf-8")
+        print(f"Сохранено: {output} ({len(text)} символов, источник: {source})")
+    else:
+        if source != "MTS":
+            print(f"# источник текста: {source}", file=sys.stderr)
+        print(f"# {fmt_track(track)}")
+        print()
+        print(text)
+
+
+# ---------------------------------------------------------------------------
 # streaming
 # ---------------------------------------------------------------------------
 
@@ -523,6 +816,37 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("query", help="поисковый запрос")
     search.add_argument("-n", "--limit", type=int, default=10, help="сколько результатов (по умолчанию 10)")
     search.set_defaults(func=cmd_search)
+
+    mix = sub.add_parser("mix", help="«Моя волна»: подборка треков")
+    mix.add_argument("-n", "--number", type=int, default=10, help="сколько треков (по умолчанию 10)")
+    mix.add_argument("--play", action="store_true", help="сразу воспроизвести подборку")
+    mix.add_argument("--player", help="путь к mpv/ffplay")
+    mix.set_defaults(func=cmd_mix)
+
+    like = sub.add_parser("like", help="добавить трек в избранное")
+    like.add_argument("track_id")
+    like.add_argument("--album", help="id альбома (если нужно переопределить)")
+    like.set_defaults(func=cmd_like)
+
+    unlike = sub.add_parser("unlike", help="убрать трек из избранного")
+    unlike.add_argument("track_id")
+    unlike.add_argument("--album", help="id альбома (если нужно переопределить)")
+    unlike.set_defaults(func=cmd_unlike)
+
+    likes = sub.add_parser("likes", help="показать избранные треки")
+    likes.add_argument("-n", "--number", type=int, default=50, help="сколько показать (по умолчанию 50)")
+    likes.set_defaults(func=cmd_likes)
+
+    lyrics = sub.add_parser("lyrics", help="показать или сохранить текст песни")
+    lyrics.add_argument("track_id")
+    lyrics.add_argument("--lrc", action="store_true", help="формат LRC с таймкодами")
+    lyrics.add_argument("-o", "--output", help="сохранить текст в файл")
+    lyrics.add_argument(
+        "--no-fallback",
+        action="store_true",
+        help="не использовать LRCLIB, если MTS не отдал текст",
+    )
+    lyrics.set_defaults(func=cmd_lyrics)
 
     url = sub.add_parser("url", help="получить прямую ссылку на MP3")
     url.add_argument("track_id")

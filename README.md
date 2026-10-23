@@ -1,7 +1,7 @@
 # MTS Music CLI
 
-Минимальный клиент для **своего** аккаунта MTS Music: поиск, ссылка на поток,
-воспроизведение и скачивание в MP3.
+Минимальный клиент для **своего** аккаунта MTS Music: «Моя волна», поиск,
+избранное, тексты песен, воспроизведение и скачивание в MP3.
 
 Внутри используется тот же путь, что и в веб-клиенте: MTS SSO выдаёт
 OAuth-токен Яндекс.Музыки, дальше запросы идут на `api.music.yandex.net`.
@@ -38,6 +38,25 @@ PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright" .venv/bin/playwright install chromiu
 # поиск
 .venv/bin/python mtsmusic.py search "miyagi" -n 10
 
+# «Моя волна»: 10 треков, ♥ — уже в избранном
+.venv/bin/python mtsmusic.py mix -n 10
+
+# сразу слушать подборку (Ctrl-C — остановить)
+.venv/bin/python mtsmusic.py mix -n 5 --play
+
+# избранное: добавить / убрать / показать
+.venv/bin/python mtsmusic.py like 12345678
+.venv/bin/python mtsmusic.py unlike 12345678
+.venv/bin/python mtsmusic.py likes -n 20
+
+# текст песни: показать, сохранить, или с таймкодами
+.venv/bin/python mtsmusic.py lyrics 12345678
+.venv/bin/python mtsmusic.py lyrics 12345678 -o track.txt
+.venv/bin/python mtsmusic.py lyrics 12345678 --lrc -o track.lrc
+
+# только права MTS, без внешнего источника
+.venv/bin/python mtsmusic.py lyrics 12345678 --no-fallback
+
 # прямая ссылка на MP3
 .venv/bin/python mtsmusic.py url 12345678
 
@@ -53,3 +72,17 @@ PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright" .venv/bin/playwright install chromiu
 ```bash
 export MTS_YA_TOKEN='...'
 ```
+
+## Ограничения
+
+- Логин автоматизирован не полностью: QRATOR-капчу проходит человек.
+- `reference_uri` у MTS должен быть на домене `music.mts.ru`, поэтому
+  локальный callback не используется — токен забирается из браузера.
+- Без активной подписки `download-info` отдаёт `preview` (короткий фрагмент).
+- Тексты песен — отдельная подписка Яндекс Плюс, которой у MTS-аккаунта нет
+  (`hasPlus: false`), поэтому MTS возвращает `404` даже для треков с текстом.
+  `lyrics` автоматически берёт текст из бесплатного [LRCLIB](https://lrclib.net)
+  и помечает источник в выводе. `--no-fallback` отключает это поведение.
+- Использовать только для личного прослушивания, не перераздавать контент.
+- Если `api.music.yandex.net` недоступен, проверь IPv6: клиент принудительно
+  ходит по IPv4.
