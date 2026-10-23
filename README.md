@@ -96,6 +96,22 @@ PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright" .venv/bin/playwright install chromiu
 export MTS_YA_TOKEN='...'
 ```
 
+## Если TUI не отображается
+
+```bash
+# диагностика окружения
+.venv/bin/python mtsmusic.py tui --check
+
+# без alternate screen (если экран пустой)
+.venv/bin/python mtsmusic.py tui --inline
+
+# отключить мышь, если терминал плохо её поддерживает
+.venv/bin/python mtsmusic.py tui --inline --no-mouse
+```
+
+TUI нужно запускать в настоящем терминале (stdin/stdout — TTY), а не в панели
+вывода IDE. При падении traceback пишется в `.mts-music/tui-error.log`.
+
 ## Ограничения
 
 - Логин автоматизирован не полностью: QRATOR-капчу проходит человек.

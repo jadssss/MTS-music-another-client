@@ -797,12 +797,67 @@ def cmd_download(args: argparse.Namespace) -> None:
 
 # ---------------------------------------------------------------------------
 # cli
+# ---------------------------------------------------------------------------
+
+
 def cmd_tui(args: argparse.Namespace) -> None:
+    if args.check:
+        print_tui_check()
+        return
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        die(
+            "TUI нужно запускать в обычном терминале (stdin/stdout не TTY).\n"
+            "Запусти прямо в окне терминала: .venv/bin/python mtsmusic.py tui\n"
+            "Если это IDE/панель вывода — открой настоящий терминал."
+        )
     try:
         from tui import MusicTui
     except ImportError as exc:
         die(f"для TUI нужен textual и pillow: {exc}. Установи: pip install -r requirements.txt")
-    MusicTui(player=args.player).run()
+    try:
+        MusicTui(player=args.player).run(inline=args.inline, mouse=not args.no_mouse)
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:  # TUI не должен молча исчезать
+        log = CONFIG_DIR / "tui-error.log"
+        try:
+            import traceback
+
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            log.write_text(traceback.format_exc(), encoding="utf-8")
+        except OSError:
+            log = Path("?")
+        die(f"TUI упал: {exc}. Подробности: {log}")
+
+
+def print_tui_check() -> None:
+    import platform
+
+    print(f"Python:       {sys.executable}")
+    print(f"Версия:       {platform.python_version()} ({platform.system()} {platform.release()})")
+    print(f"TERM:         {os.environ.get('TERM', '?')}")
+    print(f"COLORTERM:    {os.environ.get('COLORTERM', '?')}")
+    print(f"stdout TTY:   {sys.stdout.isatty()}")
+    print(f"stdin TTY:    {sys.stdin.isatty()}")
+    size = shutil.get_terminal_size()
+    print(f"Терминал:     {size.columns}x{size.lines}")
+    try:
+        import textual
+
+        print(f"textual:      {textual.__version__}")
+    except ImportError:
+        print("textual:      НЕ УСТАНОВЛЕН")
+    try:
+        import PIL
+
+        print(f"pillow:       {PIL.__version__}")
+    except ImportError:
+        print("pillow:       НЕ УСТАНОВЛЕН")
+    for name in ("ffplay", "mpv"):
+        print(f"{name}:        {shutil.which(name) or 'нет'}")
+    print(f"Креды:        {'есть' if CREDS_PATH.exists() else 'нет'} ({CREDS_PATH})")
+    if size.columns < 90 or size.lines < 30:
+        print("\nСовет: окно маленькое, TUI лучше смотреть при >= 90x30.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -858,6 +913,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     tui = sub.add_parser("tui", help="полноценный TUI-плеер (мышь, обложка, избранное)")
     tui.add_argument("--player", help="путь к mpv/ffplay")
+    tui.add_argument("--check", action="store_true", help="диагностика окружения и выход")
+    tui.add_argument(
+        "--inline",
+        action="store_true",
+        help="без alternate screen: рисовать прямо в терминале (если экран пустой)",
+    )
+    tui.add_argument("--no-mouse", action="store_true", help="отключить поддержку мыши")
     tui.set_defaults(func=cmd_tui)
 
     url = sub.add_parser("url", help="получить прямую ссылку на MP3")
