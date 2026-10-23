@@ -14,6 +14,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Click, Resize
 from textual.screen import ModalScreen, Screen
+from textual.theme import Theme
 from textual.widgets import (
     Button,
     DataTable,
@@ -47,9 +48,25 @@ COVER_MAX = 46
 COVER_MIN = 20
 COVER_CACHE = 20
 
+MONO_THEME = Theme(
+    name="mono",
+    primary="#e6e6e6",
+    secondary="#9a9a9a",
+    warning="#cfcfcf",
+    error="#ffffff",
+    success="#bdbdbd",
+    accent="#ffffff",
+    foreground="#f2f2f2",
+    background="#000000",
+    surface="#0d0d0d",
+    panel="#0a0a0a",
+    dark=True,
+)
+
 
 def cover_renderable(data: bytes, width: int) -> Text:
-    image = Image.open(io.BytesIO(data)).convert("RGB")
+    """Обложка в оттенках серого (полностью чёрно-белый интерфейс)."""
+    image = Image.open(io.BytesIO(data)).convert("L")
     rows = max(1, width // 2)
     image = image.resize((width, rows * 2), Image.Resampling.LANCZOS)
 
@@ -60,8 +77,8 @@ def cover_renderable(data: bytes, width: int) -> Text:
             bottom = image.getpixel((x, y * 2 + 1))
             canvas.append(
                 "▀",
-                style=f"#{top[0]:02x}{top[1]:02x}{top[2]:02x} "
-                f"on #{bottom[0]:02x}{bottom[1]:02x}{bottom[2]:02x}",
+                style=f"#{top:02x}{top:02x}{top:02x} "
+                f"on #{bottom:02x}{bottom:02x}{bottom:02x}",
             )
         if y != rows - 1:
             canvas.append("\n")
@@ -375,68 +392,80 @@ class MusicTui(App):
     TITLE = "MTS Music"
 
     CSS = """
-    Screen { background: $background; }
+    /* Полностью чёрно-белая тема: только оттенки серого. */
+    Screen { background: #000000; color: #f2f2f2; }
+
+    Button {
+        background: #101010;
+        color: #f2f2f2;
+        border: tall #4a4a4a;
+        text-style: bold;
+    }
+    Button:hover { background: #1c1c1c; border: tall #9a9a9a; }
+    Button:focus { border: tall #ffffff; }
+    Button.-active { background: #2a2a2a; }
 
     #topbar {
         height: 3;
         dock: top;
         padding: 0 1;
         align: left middle;
-        background: $panel;
+        background: #0a0a0a;
     }
     #menu { width: 5; min-width: 5; margin: 0 1 0 0; }
-    #brand { text-style: bold; padding: 0 1; }
-    #topstatus { width: 1fr; text-align: right; content-align: right middle; color: $text-muted; }
+    #brand { text-style: bold; padding: 0 1; color: #f2f2f2; }
+    #topstatus { width: 1fr; text-align: right; content-align: right middle; color: #8a8a8a; }
 
     #phone {
         height: 1fr;
         align: center middle;
-        padding: 1 1 0 1;
+        padding: 1 0 0 0;
     }
+    /* Колонка ровно по ширине обложки: всё под обложкой выровнено по ней. */
+    #column { width: 40; height: auto; align: center top; }
     #cover {
-        width: 40;
+        width: 100%;
         height: 20;
         content-align: center middle;
-        color: $text-muted;
+        color: #8a8a8a;
         margin-bottom: 1;
     }
-    #title { width: 100%; text-align: center; text-style: bold; }
-    #artist { width: 100%; text-align: center; color: $text-muted; }
-    #album { width: 100%; text-align: center; color: $text-disabled; }
-    #time { width: 100%; text-align: center; color: $text-muted; margin-top: 1; }
-    #progress { width: 44; }
+    #title { width: 100%; text-align: center; text-style: bold; color: #ffffff; }
+    #artist { width: 100%; text-align: center; color: #b0b0b0; }
+    #album { width: 100%; text-align: center; color: #6a6a6a; }
+    #time { width: 100%; text-align: center; color: #8a8a8a; margin-top: 1; }
+    #progress { width: 100%; }
     #controls { height: 3; align: center middle; margin-top: 1; }
-    #prev, #next { width: 7; min-width: 7; }
-    #playpause { width: 13; min-width: 13; margin: 0 2; }
-    #actions { height: 3; align: center middle; }
-    #actions Button { width: 20; min-width: 20; margin: 0 1; }
+    #prev, #playpause, #next { height: 3; min-width: 4; }
+    #actions { height: 3; align: center middle; margin-top: 1; }
+    #actions Button { height: 3; min-width: 4; }
 
     #screen-top {
         height: 3;
         dock: top;
         padding: 0 1;
         align: left middle;
-        background: $panel;
+        background: #0a0a0a;
     }
     #back { width: 5; min-width: 5; margin-right: 1; }
-    #screen-title { text-style: bold; width: 1fr; content-align: left middle; }
-    #screen-status { height: 1; padding: 0 1; color: $text-muted; }
-    #list-table { height: 1fr; }
+    #screen-title { text-style: bold; width: 1fr; content-align: left middle; color: #f2f2f2; }
+    #screen-status { height: 1; padding: 0 1; color: #8a8a8a; }
+    #list-table { height: 1fr; background: #000000; }
     #search-row { height: 3; padding: 0 1; }
     #search-input { width: 1fr; }
     #search-go { width: 12; margin-left: 1; }
     #lyrics-scroll { height: 1fr; padding: 0 2; }
-    #lyrics-body { width: 100%; }
+    #lyrics-body { width: 100%; color: #e0e0e0; }
 
-    MenuScreen { align: left middle; background: $background 60%; }
+    MenuScreen { align: left middle; background: #000000 70%; }
     #menu-panel {
         width: 42;
         height: 100%;
-        background: $surface;
-        border-right: thick $accent;
+        background: #0d0d0d;
+        border-right: thick #ffffff;
         padding: 1 2;
     }
-    #menu-title { text-style: bold; padding: 0 0 1 0; }
+    #menu-title { text-style: bold; padding: 0 0 1 0; color: #ffffff; }
     #menu-panel Button { width: 100%; margin: 1 0; }
     #menu-spacer { height: 1fr; }
     """
@@ -483,23 +512,26 @@ class MusicTui(App):
             yield Button("☰", id="menu")
             yield Static("MTS Music", id="brand")
             yield Static("", id="topstatus")
-        with Vertical(id="phone"):
-            yield Static("♪", id="cover")
-            yield Static("", id="title")
-            yield Static("", id="artist")
-            yield Static("", id="album")
-            yield Static("0:00 / 0:00", id="time")
-            yield ProgressBar(total=100, show_eta=False, show_percentage=False, id="progress")
-            with Horizontal(id="controls"):
-                yield Button("⏮", id="prev")
-                yield Button("▶", id="playpause", variant="primary")
-                yield Button("⏭", id="next")
-            with Horizontal(id="actions"):
-                yield Button("Текст", id="lyrics")
-                yield Button("♡ В избранное", id="like", variant="success")
+        with Horizontal(id="phone"):
+            with Vertical(id="column"):
+                yield Static("♪", id="cover")
+                yield Static("", id="title")
+                yield Static("", id="artist")
+                yield Static("", id="album")
+                yield Static("0:00 / 0:00", id="time")
+                yield ProgressBar(total=100, show_eta=False, show_percentage=False, id="progress")
+                with Horizontal(id="controls"):
+                    yield Button("⏮", id="prev")
+                    yield Button("▶", id="playpause")
+                    yield Button("⏭", id="next")
+                with Horizontal(id="actions"):
+                    yield Button("Текст", id="lyrics")
+                    yield Button("♡ В избранное", id="like")
         yield Footer()
 
     def on_mount(self) -> None:
+        self.register_theme(MONO_THEME)
+        self.theme = "mono"
         self.set_interval(0.4, self.tick)
         self.apply_cover_width()
         try:
@@ -526,24 +558,31 @@ class MusicTui(App):
 
     def apply_cover_width(self) -> None:
         self.cover_width = self.cover_width_for(self.size.width, self.size.height)
+        self.apply_column_width(self.cover_width)
+
+    def apply_column_width(self, width: int) -> None:
+        """Ширина колонки равна обложке; кнопки растянуты ровно по ней."""
         try:
-            cover = self.query_one("#cover", Static)
+            self.query_one("#column").styles.width = width
+            self.query_one("#cover").styles.height = max(4, width // 2)
+            side = max(4, width // 4)
+            play = max(6, width - side * 2)
+            self.query_one("#prev").styles.width = side
+            self.query_one("#next").styles.width = side
+            self.query_one("#playpause").styles.width = play
+            half = max(5, width // 2)
+            self.query_one("#lyrics").styles.width = half
+            self.query_one("#like").styles.width = width - half
+            self.update_like_button()
         except Exception:
             return
-        cover.styles.width = self.cover_width
-        cover.styles.height = max(4, self.cover_width // 2)
 
     def on_resize(self, event: Resize) -> None:
         width = self.cover_width_for(event.size.width, event.size.height)
         if width == self.cover_width:
             return
         self.cover_width = width
-        try:
-            cover = self.query_one("#cover", Static)
-            cover.styles.width = width
-            cover.styles.height = max(4, width // 2)
-        except Exception:
-            return
+        self.apply_column_width(width)
         url = track_cover_url(self.current) if self.current else None
         if url and url in self.cover_bytes:
             self.show_cover(url)
@@ -610,8 +649,9 @@ class MusicTui(App):
         if liked is None:
             liked = bool(self.current and str(self.current.get("id")) in self.liked_ids)
         button = self.query_one("#like", Button)
-        button.label = "♥ В избранном" if liked else "♡ В избранное"
-        button.variant = "warning" if liked else "success"
+        heart = "♥" if liked else "♡"
+        suffix = " Избранное" if self.cover_width >= 34 else ""
+        button.label = heart + suffix
 
     def update_play_button(self) -> None:
         self.query_one("#playpause", Button).label = "⏸" if self.player.paused else "▶"
