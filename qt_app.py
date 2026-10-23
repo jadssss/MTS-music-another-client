@@ -31,12 +31,19 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
 )
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimedia import (
+    QAudioDevice,
+    QAudioOutput,
+    QMediaDevices,
+    QMediaPlayer,
+)
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QAbstractButton,
+    QCheckBox,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -67,6 +74,7 @@ from media import (
 from mtsmusic import (
     USER_AGENT,
     Api,
+    fetch_liked_tracks,
     fetch_mix_batch,
     fmt_duration,
     force_ipv4,
@@ -75,6 +83,12 @@ from mtsmusic import (
     lyrics_response,
     lyrics_text,
     resolve_stream,
+)
+from settings import (
+    START_QUEUE_LABELS,
+    START_QUEUES,
+    load_settings,
+    update_settings,
 )
 
 APP_QSS = """
@@ -140,6 +154,23 @@ QLineEdit {
     padding: 9px 12px; font-size: 14px; selection-background-color: #ff3b5c;
 }
 QLineEdit:focus { border-color: rgba(255,59,92,0.53); }
+#settingLabel { color: #a7a7b8; font-size: 13px; min-width: 118px; }
+#settingValue { color: #f2f2f7; font-size: 12px; min-width: 42px; }
+QComboBox {
+    background: #1b1b25; border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 10px; padding: 6px 10px; color: #f2f2f7;
+}
+QComboBox::drop-down { border: none; width: 20px; }
+QComboBox QAbstractItemView {
+    background: #1b1b25; color: #f2f2f7;
+    border: 1px solid rgba(255,255,255,0.10);
+    selection-background-color: #ff3b5c;
+}
+QCheckBox { color: #dcdce6; font-size: 13px; spacing: 8px; }
+QCheckBox::indicator { width: 16px; height: 16px; }
+QCheckBox::indicator:unchecked {
+    border: 1px solid rgba(255,255,255,0.35); border-radius: 4px; background: #1b1b25;
+}
 #searchBtn {
     background: #ff3b5c; border: none; border-radius: 13px;
     padding: 9px 16px; font-weight: 600;
@@ -245,6 +276,8 @@ class CoverView(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._pixmap: QPixmap | None = None
+        self._scaled: QPixmap | None = None
+        self._scaled_side = 0
         self.setMinimumSize(220, 220)
         self.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred
@@ -252,6 +285,8 @@ class CoverView(QWidget):
 
     def set_pixmap(self, pixmap: QPixmap | None) -> None:
         self._pixmap = pixmap
+        self._scaled = None
+        self._scaled_side = 0
         self.update()
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt API
@@ -267,12 +302,15 @@ class CoverView(QWidget):
         painter.setClipPath(clip)
 
         if self._pixmap and not self._pixmap.isNull():
-            scaled = self._pixmap.scaled(
-                int(side),
-                int(side),
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+            if self._scaled is None or self._scaled_side != int(side):
+                self._scaled = self._pixmap.scaled(
+                    int(side),
+                    int(side),
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                self._scaled_side = int(side)
+            scaled = self._scaled
             dx = x - (scaled.width() - side) / 2
             dy = y - (scaled.height() - side) / 2
             painter.drawPixmap(int(dx), int(dy), scaled)
@@ -405,6 +443,7 @@ class QtMusicApp(QMainWindow):
     def __init__(self, api: Api) -> None:
         super().__init__()
         self.api = api
+        self.settings = load_settings()
         self.uid = ""
         self.wave: list[dict] = []
         self.queue: list[dict] = []
@@ -436,7 +475,7 @@ class QtMusicApp(QMainWindow):
 
         self.player = QMediaPlayer(self)
         self.audio = QAudioOutput(self)
-        self.audio.setVolume(0.8)
+        self.audio.setVolume(int(self.settings.get("volume", 80)) / 100)
         self.player.setAudioOutput(self.audio)
         self.player.positionChanged.connect(self.on_position)
         self.player.durationChanged.connect(self.on_player_duration)
@@ -449,11 +488,6 @@ class QtMusicApp(QMainWindow):
         self._build_toast()
         self._update_cover_size()
         self.play_btn.setFocus()
-
-        self._timer = QTimer(self)
-        self._timer.setInterval(500)
-        self._timer.timeout.connect(self._update_idle_time)
-        self._timer.start()
 
         QTimer.singleShot(0, self.load_initial)
 
@@ -522,6 +556,9 @@ class QtMusicApp(QMainWindow):
             self._build_lyrics_page()
         )
         self.pages.addWidget(self.lyrics_page)
+
+        self.settings_page = self._build_settings_page()
+        self.pages.addWidget(self.settings_page)
 
         self._setup_tab_order()
 
@@ -759,6 +796,124 @@ class QtMusicApp(QMainWindow):
         layout.addWidget(body, 1)
         return page, title, status, body
 
+    def _build_settings_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 10, 18, 14)
+        layout.setSpacing(12)
+        layout.addLayout(self._page_header("Настройки"))
+
+        vol_row = QHBoxLayout()
+        vol_row.setSpacing(10)
+        vol_label = QLabel("Громкость")
+        vol_label.setObjectName("settingLabel")
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(int(self.settings.get("volume", 80)))
+        self.volume_value = QLabel(f"{self.volume_slider.value()} %")
+        self.volume_value.setObjectName("settingValue")
+        self.volume_slider.valueChanged.connect(self.on_volume_changed)
+        vol_row.addWidget(vol_label)
+        vol_row.addWidget(self.volume_slider, 1)
+        vol_row.addWidget(self.volume_value)
+        layout.addLayout(vol_row)
+
+        dev_row = QHBoxLayout()
+        dev_row.setSpacing(10)
+        dev_label = QLabel("Устройство")
+        dev_label.setObjectName("settingLabel")
+        self.device_combo = QComboBox()
+        self.device_combo.setObjectName("settingCombo")
+        for device in QMediaDevices.audioOutputs():
+            self.device_combo.addItem(device.description(), device)
+        current_device = self.audio.device()
+        if current_device and not current_device.isNull():
+            idx = self.device_combo.findData(current_device)
+            if idx >= 0:
+                self.device_combo.setCurrentIndex(idx)
+        self.device_combo.currentIndexChanged.connect(self.on_device_changed)
+        dev_row.addWidget(dev_label)
+        dev_row.addWidget(self.device_combo, 1)
+        layout.addLayout(dev_row)
+
+        seek_row = QHBoxLayout()
+        seek_row.setSpacing(10)
+        seek_label = QLabel("Шаг перемотки")
+        seek_label.setObjectName("settingLabel")
+        self.seek_step_slider = QSlider(Qt.Orientation.Horizontal)
+        self.seek_step_slider.setRange(1, 60)
+        self.seek_step_slider.setValue(int(self.settings.get("seek_step", 5)))
+        self.seek_step_value = QLabel(f"{self.seek_step_slider.value()} с")
+        self.seek_step_value.setObjectName("settingValue")
+        self.seek_step_slider.valueChanged.connect(self.on_seek_step_changed)
+        seek_row.addWidget(seek_label)
+        seek_row.addWidget(self.seek_step_slider, 1)
+        seek_row.addWidget(self.seek_step_value)
+        layout.addLayout(seek_row)
+
+        self.autoplay_check = QCheckBox("Запускать воспроизведение при старте")
+        self.autoplay_check.setChecked(bool(self.settings.get("autoplay")))
+        self.autoplay_check.toggled.connect(self.on_autoplay_toggled)
+        layout.addWidget(self.autoplay_check)
+
+        start_row = QHBoxLayout()
+        start_row.setSpacing(10)
+        start_label = QLabel("Стартовый список")
+        start_label.setObjectName("settingLabel")
+        self.start_combo = QComboBox()
+        self.start_combo.setObjectName("settingCombo")
+        for key in START_QUEUES:
+            self.start_combo.addItem(START_QUEUE_LABELS[key], key)
+        start_index = self.start_combo.findData(self.settings.get("start_queue", "wave"))
+        self.start_combo.setCurrentIndex(max(0, start_index))
+        self.start_combo.currentIndexChanged.connect(self.on_start_changed)
+        start_row.addWidget(start_label)
+        start_row.addWidget(self.start_combo, 1)
+        layout.addLayout(start_row)
+
+        self.wave_check = QCheckBox("Продолжать «Мою волну» с последних треков")
+        self.wave_check.setChecked(bool(self.settings.get("wave_from_history", True)))
+        self.wave_check.toggled.connect(self.on_wave_from_history_toggled)
+        layout.addWidget(self.wave_check)
+
+        hint = QLabel("Настройки сохраняются в .mts-music/settings.json")
+        hint.setObjectName("pageStatus")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        layout.addStretch(1)
+        return page
+
+    # -- настройки --------------------------------------------------------
+
+    def update_setting(self, key: str, value) -> None:
+        self.settings = update_settings(**{key: value})
+
+    def on_volume_changed(self, value: int) -> None:
+        self.volume_value.setText(f"{value} %")
+        self.audio.setVolume(value / 100)
+        self.update_setting("volume", value)
+
+    def on_device_changed(self, index: int) -> None:
+        device = self.device_combo.itemData(index)
+        if isinstance(device, QAudioDevice) and not device.isNull():
+            self.audio.setDevice(device)
+
+    def on_seek_step_changed(self, value: int) -> None:
+        self.seek_step_value.setText(f"{value} с")
+        self.update_setting("seek_step", value)
+
+    def on_autoplay_toggled(self, checked: bool) -> None:
+        self.update_setting("autoplay", checked)
+
+    def on_start_changed(self, index: int) -> None:
+        self.update_setting("start_queue", self.start_combo.itemData(index))
+
+    def on_wave_from_history_toggled(self, checked: bool) -> None:
+        self.update_setting("wave_from_history", checked)
+
+    def show_settings(self) -> None:
+        self._show(self.settings_page)
+
     def _build_drawer(self) -> None:
         central = self.centralWidget()
         self.scrim = Scrim(central)
@@ -784,6 +939,7 @@ class QtMusicApp(QMainWindow):
             ("История", self.show_history),
             ("Поиск", self.show_search),
             ("Текст песни", self.show_lyrics),
+            ("Настройки", self.show_settings),
         ):
             button = QPushButton(text)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -923,34 +1079,51 @@ class QtMusicApp(QMainWindow):
         self.set_top_status("Загрузка…")
         self.run_task(self._fetch_initial, self.apply_initial, self.on_error)
 
-    def _fetch_initial(self) -> tuple[str, list[dict], set[str]]:
+    def _fetch_initial(self) -> tuple[str, list[dict], set[str], list[dict], str]:
         api = self.api
         uid = self.uid or get_uid(api)
         # Продолжаем волну с последних прослушанных треков, а не с начала.
-        seed = [str(track.get("id")) for track in self.history[:5]]
-        batch = fetch_mix_batch(api, seed or None)
+        if self.settings.get("wave_from_history", True):
+            seed = [str(track.get("id")) for track in self.history[:5]]
+        else:
+            seed = None
+        batch = fetch_mix_batch(api, seed)
         wave = [
             item["track"]
             for item in (batch.get("sequence") or [])
             if item.get("type") == "track" and item.get("track")
         ]
-        payload = api.get(f"/users/{uid}/likes/tracks")
-        refs = ((payload.get("result") or {}).get("library") or {}).get("tracks") or []
-        liked = {str(ref.get("id")) for ref in refs}
-        return uid, wave, liked
-
-    def apply_initial(self, result: tuple[str, list[dict], set[str]]) -> None:
-        self.uid, self.wave, self.liked_ids = result
-        self.queue = list(self.wave)
-        self.queue_name = "Моя волна"
-        self.set_top_status(f"Волна · {len(self.wave)} · ♥ {len(self.liked_ids)}")
-        if self.wave:
-            self.current = self.wave[0]
-            self.current_index = 0
-            self.update_now_playing()
-            self.load_cover(self.wave[0])
+        want = self.settings.get("start_queue", "wave")
+        start: list[dict] = wave
+        name = "Моя волна"
+        if want == "favorites":
+            start = fetch_liked_tracks(api, uid)
+            name = "Избранное"
+            liked = {str(track.get("id")) for track in start}
         else:
+            payload = api.get(f"/users/{uid}/likes/tracks")
+            refs = ((payload.get("result") or {}).get("library") or {}).get("tracks") or []
+            liked = {str(ref.get("id")) for ref in refs}
+            if want == "history":
+                start, name = list(self.history), "История"
+        return uid, wave, liked, start, name
+
+    def apply_initial(
+        self, result: tuple[str, list[dict], set[str], list[dict], str]
+    ) -> None:
+        self.uid, self.wave, self.liked_ids, start, name = result
+        self.queue = list(start)
+        self.queue_name = name
+        if not start:
             self.title_label.setText("Ничего не найдено")
+            return
+        self.set_top_status(f"{name} · {len(start)} · ♥ {len(self.liked_ids)}")
+        self.current = start[0]
+        self.current_index = 0
+        self.update_now_playing()
+        self.load_cover(start[0])
+        if self.settings.get("autoplay"):
+            self.play_track(start[0], self.queue, 0)
 
     # -- текущий трек -----------------------------------------------------
 
@@ -981,13 +1154,6 @@ class QtMusicApp(QMainWindow):
     def update_play_button(self, *args) -> None:
         playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
         self.play_btn.setIcon(media_icon("pause" if playing else "play", 80))
-
-    def _update_idle_time(self) -> None:
-        if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-            return
-        if self._seeking:
-            return
-        self.on_position(self.player.position())
 
     # -- обложка ----------------------------------------------------------
 
@@ -1347,17 +1513,7 @@ class QtMusicApp(QMainWindow):
 
     def _fetch_favorites(self) -> list[dict]:
         uid = self.uid or get_uid(self.api)
-        payload = self.api.get(f"/users/{uid}/likes/tracks")
-        refs = ((payload.get("result") or {}).get("library") or {}).get("tracks") or []
-        ids = [str(ref.get("id")) for ref in refs[:300]]
-        tracks: list[dict] = []
-        for start in range(0, len(ids), 50):
-            chunk = ids[start : start + 50]
-            if chunk:
-                tracks.extend(
-                    self.api.get("/tracks", trackIds=",".join(chunk)).get("result") or []
-                )
-        return tracks
+        return fetch_liked_tracks(self.api, uid)
 
     def apply_favorites(self, tracks: list[dict]) -> None:
         self._favorites_loading = False
@@ -1447,9 +1603,9 @@ class QtMusicApp(QMainWindow):
         if key == Qt.Key.Key_Space:
             self.toggle_play()
         elif key == Qt.Key.Key_Left:
-            self.seek(-5000)
+            self.seek(-int(self.settings.get("seek_step", 5)) * 1000)
         elif key == Qt.Key.Key_Right:
-            self.seek(5000)
+            self.seek(int(self.settings.get("seek_step", 5)) * 1000)
         elif key == Qt.Key.Key_N:
             self.advance(1)
         elif key == Qt.Key.Key_P:

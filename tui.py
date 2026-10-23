@@ -43,6 +43,12 @@ from mtsmusic import (
     resolve_stream,
 )
 from player import MusicPlayer
+from settings import (
+    START_QUEUE_LABELS,
+    START_QUEUES,
+    load_settings,
+    update_settings,
+)
 
 COVER_MAX = 46
 COVER_MIN = 20
@@ -177,17 +183,9 @@ class FavoritesScreen(Screen):
             return
         try:
             uid = self.app.uid or get_uid(api)
-            payload = api.get(f"/users/{uid}/likes/tracks")
-            refs = ((payload.get("result") or {}).get("library") or {}).get("tracks") or []
-            ids = [str(ref.get("id")) for ref in refs[:300]]
-            tracks: list[dict] = []
-            for start in range(0, len(ids), 50):
-                chunk = ids[start : start + 50]
-                if not chunk:
-                    continue
-                tracks.extend(
-                    api.get("/tracks", trackIds=",".join(chunk)).get("result") or []
-                )
+            from mtsmusic import fetch_liked_tracks
+
+            tracks = fetch_liked_tracks(api, uid)
             self.app.call_from_thread(self.fill, tracks)
         except SystemExit as exc:
             self.app.call_from_thread(self.failed, str(exc))
@@ -361,6 +359,78 @@ class LyricsScreen(Screen):
         body.update(Text(text))
 
 
+class SettingsScreen(Screen):
+    BINDINGS = [Binding("escape", "back", "Назад")]
+
+    def compose(self) -> ComposeResult:
+        yield make_topbar("Настройки")
+        with VerticalScroll(id="settings-scroll"):
+            with Horizontal(classes="srow"):
+                yield Static("Громкость", classes="slabel")
+                yield Button("−", id="vol-down", classes="sstep")
+                yield Static("", id="vol-value", classes="svalue")
+                yield Button("+", id="vol-up", classes="sstep")
+            with Horizontal(classes="srow"):
+                yield Static("Шаг перемотки", classes="slabel")
+                yield Button("−", id="seek-down", classes="sstep")
+                yield Static("", id="seek-value", classes="svalue")
+                yield Button("+", id="seek-up", classes="sstep")
+            with Horizontal(classes="srow"):
+                yield Static("Автовоспроизведение", classes="slabel")
+                yield Button("", id="autoplay-toggle", classes="stoggle")
+            with Horizontal(classes="srow"):
+                yield Static("Стартовый список", classes="slabel")
+                yield Button("", id="start-toggle", classes="stoggle")
+            with Horizontal(classes="srow"):
+                yield Static("Волна с последних треков", classes="slabel")
+                yield Button("", id="wave-toggle", classes="stoggle")
+            yield Static("", id="settings-path")
+
+    def on_mount(self) -> None:
+        self.refresh_values()
+        from settings import settings_path
+
+        self.query_one("#settings-path", Static).update(f"Файл: {settings_path()}")
+
+    def refresh_values(self) -> None:
+        s = self.app.settings
+        self.query_one("#vol-value", Static).update(f"{s['volume']} %")
+        self.query_one("#seek-value", Static).update(f"{s['seek_step']} с")
+        self.query_one("#autoplay-toggle", Button).label = "вкл" if s["autoplay"] else "выкл"
+        self.query_one("#start-toggle", Button).label = START_QUEUE_LABELS[s["start_queue"]]
+        self.query_one("#wave-toggle", Button).label = (
+            "вкл" if s["wave_from_history"] else "выкл"
+        )
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    @on(Button.Pressed)
+    def pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        s = self.app.settings
+        if bid == "back":
+            self.action_back()
+            return
+        if bid == "vol-down":
+            self.app.update_setting("volume", max(0, s["volume"] - 5))
+        elif bid == "vol-up":
+            self.app.update_setting("volume", min(100, s["volume"] + 5))
+        elif bid == "seek-down":
+            self.app.update_setting("seek_step", max(1, s["seek_step"] - 1))
+        elif bid == "seek-up":
+            self.app.update_setting("seek_step", min(60, s["seek_step"] + 1))
+        elif bid == "autoplay-toggle":
+            self.app.update_setting("autoplay", not s["autoplay"])
+        elif bid == "start-toggle":
+            order = list(START_QUEUES)
+            index = order.index(s["start_queue"])
+            self.app.update_setting("start_queue", order[(index + 1) % len(order)])
+        elif bid == "wave-toggle":
+            self.app.update_setting("wave_from_history", not s["wave_from_history"])
+        self.refresh_values()
+
+
 class MenuScreen(ModalScreen[str | None]):
     BINDINGS = [Binding("escape", "close", "Закрыть")]
 
@@ -372,6 +442,7 @@ class MenuScreen(ModalScreen[str | None]):
             yield Button("История", id="m-history")
             yield Button("Поиск", id="m-search")
             yield Button("Текст песни", id="m-lyrics")
+            yield Button("Настройки", id="m-settings")
             yield Static("", id="menu-spacer")
             yield Button("Выход", id="m-quit", variant="error")
 
@@ -468,6 +539,14 @@ class MusicTui(App):
     #menu-title { text-style: bold; padding: 0 0 1 0; color: #ffffff; }
     #menu-panel Button { width: 100%; margin: 1 0; }
     #menu-spacer { height: 1fr; }
+
+    #settings-scroll { height: 1fr; padding: 1 2; }
+    .srow { height: 3; align: left middle; }
+    .slabel { width: 1fr; content-align: left middle; color: #d0d0d0; }
+    .svalue { width: 8; content-align: center middle; color: #ffffff; }
+    .sstep { width: 5; min-width: 5; }
+    .stoggle { width: 16; min-width: 12; }
+    #settings-path { padding: 1 0; color: #6a6a6a; }
     """
 
     BINDINGS = [
@@ -489,9 +568,10 @@ class MusicTui(App):
     def __init__(self, player: str | None = None) -> None:
         super().__init__()
         self.explicit_player = player
+        self.settings = load_settings()
         self.api: Api | None = None
         self.uid = ""
-        self.player = MusicPlayer(player)
+        self.player = MusicPlayer(player, volume=int(self.settings.get("volume", 80)))
         self.wave: list[dict] = []
         self.favorites: list[dict] = []
         self.liked_ids: set[str] = set()
@@ -503,6 +583,7 @@ class MusicTui(App):
         self.play_token = 0
         self.cover_token = 0
         self.cover_bytes: dict[str, bytes] = {}
+        self.cover_rendered: dict[tuple[str, int], Text] = {}
         self.cover_width = 40
 
     # -- разметка ---------------------------------------------------------
@@ -596,36 +677,59 @@ class MusicTui(App):
             return
         try:
             self.uid = get_uid(api)
-            from mtsmusic import fetch_mix_batch
+            from mtsmusic import fetch_liked_tracks, fetch_mix_batch
 
             # Продолжаем волну с последних прослушанных треков, а не с начала.
-            seed = [str(track.get("id")) for track in self.history[:5]]
-            batch = fetch_mix_batch(api, seed or None)
+            if self.settings.get("wave_from_history", True):
+                seed = [str(track.get("id")) for track in self.history[:5]]
+            else:
+                seed = None
+            batch = fetch_mix_batch(api, seed)
             wave = [
                 item["track"]
                 for item in (batch.get("sequence") or [])
                 if item.get("type") == "track" and item.get("track")
             ]
-            payload = api.get(f"/users/{self.uid}/likes/tracks")
-            refs = ((payload.get("result") or {}).get("library") or {}).get("tracks") or []
-            liked = {str(ref.get("id")) for ref in refs}
-            self.call_from_thread(self.apply_initial, wave, liked)
+            want = self.settings.get("start_queue", "wave")
+            start: list[dict] = wave
+            name = "Моя волна"
+            if want == "favorites":
+                start = fetch_liked_tracks(api, self.uid)
+                name = "Избранное"
+                liked = {str(track.get("id")) for track in start}
+            else:
+                payload = api.get(f"/users/{self.uid}/likes/tracks")
+                refs = ((payload.get("result") or {}).get("library") or {}).get("tracks") or []
+                liked = {str(ref.get("id")) for ref in refs}
+                if want == "history":
+                    start, name = list(self.history), "История"
+            self.call_from_thread(self.apply_initial, wave, liked, start, name)
         except SystemExit as exc:
             self.call_from_thread(self.notify, f"Ошибка загрузки: {exc}", severity="error")
         except requests.RequestException as exc:
             self.call_from_thread(self.notify, f"Сеть недоступна: {exc}", severity="error")
 
-    def apply_initial(self, wave: list[dict], liked: set[str]) -> None:
+    def apply_initial(
+        self,
+        wave: list[dict],
+        liked: set[str],
+        start: list[dict],
+        name: str,
+    ) -> None:
         self.wave = wave
         self.liked_ids = liked
-        self.set_topstatus(f"Волна · {len(self.wave)} · ♥ {len(self.liked_ids)}")
-        if self.wave:
-            self.current = self.wave[0]
-            self.current_index = 0
-            self.queue = self.wave
-            self.queue_name = "Моя волна"
-            self.update_now_playing()
-            self.load_cover(self.wave[0])
+        if not start:
+            self.set_topstatus("Ничего не найдено")
+            return
+        self.queue = list(start)
+        self.queue_name = name
+        self.current = start[0]
+        self.current_index = 0
+        self.set_topstatus(f"{name} · {len(start)} · ♥ {len(self.liked_ids)}")
+        self.update_now_playing()
+        self.load_cover(start[0])
+        if self.settings.get("autoplay"):
+            self.play_track(start[0], self.queue, 0)
 
     def set_topstatus(self, text: str) -> None:
         self.query_one("#topstatus", Static).update(text)
@@ -677,10 +781,18 @@ class MusicTui(App):
         if not data:
             self.show_placeholder_cover()
             return
-        try:
-            self.query_one("#cover", Static).update(cover_renderable(data, self.cover_width))
-        except (OSError, ValueError):
-            self.show_placeholder_cover()
+        key = (url, self.cover_width)
+        rendered = self.cover_rendered.get(key)
+        if rendered is None:
+            try:
+                rendered = cover_renderable(data, self.cover_width)
+            except (OSError, ValueError):
+                self.show_placeholder_cover()
+                return
+            if len(self.cover_rendered) >= COVER_CACHE * 2:
+                self.cover_rendered.pop(next(iter(self.cover_rendered)))
+            self.cover_rendered[key] = rendered
+        self.query_one("#cover", Static).update(rendered)
 
     def load_cover(self, track: dict) -> None:
         self.cover_token += 1
@@ -818,10 +930,10 @@ class MusicTui(App):
         self.try_next(-1)
 
     def action_seek_back(self) -> None:
-        self.seek(-5)
+        self.seek(-self.settings["seek_step"])
 
     def action_seek_forward(self) -> None:
-        self.seek(5)
+        self.seek(self.settings["seek_step"])
 
     def seek(self, delta: float) -> None:
         if not self.current or not self.player.is_playing():
@@ -942,8 +1054,21 @@ class MusicTui(App):
             self.push_screen(SearchScreen())
         elif action == "m-lyrics":
             self.action_show_lyrics()
+        elif action == "m-settings":
+            self.push_screen(SettingsScreen())
         elif action == "m-quit":
             self.exit()
+
+    # -- настройки --------------------------------------------------------
+
+    def update_setting(self, key: str, value) -> None:
+        self.settings = update_settings(**{key: value})
+        self.apply_settings()
+
+    def apply_settings(self) -> None:
+        volume = int(self.settings.get("volume", 80))
+        if self.player.volume != volume:
+            self.run_worker(self.player.set_volume(volume), group="volume", exclusive=True)
 
     def action_show_favorites(self) -> None:
         self.push_screen(FavoritesScreen())

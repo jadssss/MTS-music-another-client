@@ -411,6 +411,21 @@ def fetch_mix_batch(api: Api, queue: list[str] | None = None) -> dict:
     return api.get(f"/rotor/station/{WAVE_STATION}/tracks", **params).get("result") or {}
 
 
+def fetch_liked_tracks(api: Api, uid: str, limit: int = 300) -> list[dict]:
+    """Избранные треки с деталями: /tracks принимает не больше 50 id за раз."""
+    payload = api.get(f"/users/{uid}/likes/tracks")
+    refs = ((payload.get("result") or {}).get("library") or {}).get("tracks") or []
+    ids = [str(ref.get("id")) for ref in refs[:limit]]
+    tracks: list[dict] = []
+    for start in range(0, len(ids), 50):
+        chunk = ids[start : start + 50]
+        if chunk:
+            tracks.extend(
+                api.get("/tracks", trackIds=",".join(chunk)).get("result") or []
+            )
+    return tracks
+
+
 def print_mix_item(index: int, item: dict) -> None:
     track = item.get("track") or {}
     heart = "♥" if item.get("liked") else " "
@@ -841,6 +856,33 @@ def cmd_qt(args: argparse.Namespace) -> None:
     raise SystemExit(qt_main())
 
 
+def cmd_settings(args: argparse.Namespace) -> None:
+    # Импорт внутри функции: settings.py сам зависит от mtsmusic.CONFIG_DIR.
+    from settings import DEFAULTS, load_settings, settings_path, save_settings
+
+    saved = False
+    if args.set:
+        updates: dict = {}
+        for pair in args.set:
+            if "=" not in pair:
+                die(f"неверный формат: {pair} (нужно ключ=значение)")
+            key, value = pair.split("=", 1)
+            key = key.strip()
+            if key not in DEFAULTS:
+                die(f"неизвестная настройка: {key}. Доступны: {', '.join(DEFAULTS)}")
+            updates[key] = value
+        current = save_settings(updates)
+        saved = True
+    else:
+        current = load_settings()
+
+    for key, default in DEFAULTS.items():
+        print(f"{key:<18} = {current.get(key, default)}")
+    print(f"\nФайл: {settings_path()}")
+    if saved:
+        print("Сохранено.")
+
+
 def print_tui_check() -> None:
     import platform
 
@@ -935,6 +977,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     qt = sub.add_parser("qt", help="настольное Qt-приложение (PySide6)")
     qt.set_defaults(func=cmd_qt)
+
+    settings = sub.add_parser("settings", help="показать или изменить настройки")
+    settings.add_argument(
+        "-s",
+        "--set",
+        nargs="+",
+        metavar="KEY=VALUE",
+        help="изменить настройки, например: -s volume=60 seek_step=10",
+    )
+    settings.set_defaults(func=cmd_settings)
 
     url = sub.add_parser("url", help="получить прямую ссылку на MP3")
     url.add_argument("track_id")

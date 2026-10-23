@@ -16,7 +16,7 @@ from pathlib import Path
 
 
 class MusicPlayer:
-    def __init__(self, explicit: str | None = None) -> None:
+    def __init__(self, explicit: str | None = None, volume: int = 80) -> None:
         self.path = self._pick(explicit)
         self.proc: asyncio.subprocess.Process | None = None
         self.url: str | None = None
@@ -26,6 +26,7 @@ class MusicPlayer:
         self.paused_total = 0.0
         self.paused_at = 0.0
         self.switching = False
+        self.volume = max(0, min(100, int(volume)))
 
     @staticmethod
     def _pick(explicit: str | None) -> str | None:
@@ -47,16 +48,33 @@ class MusicPlayer:
                 self.path or "ffplay",
                 "-nodisp",
                 "-autoexit",
+                "-volume",
+                str(self.volume),
                 "-loglevel",
                 "error",
             ]
             if start > 0:
                 command += ["-ss", f"{start:.3f}"]
             return command + [url]
-        command = [self.path or "mpv", "--no-video", "--really-quiet"]
+        command = [
+            self.path or "mpv",
+            "--no-video",
+            "--really-quiet",
+            f"--volume={self.volume}",
+        ]
         if start > 0:
             command.append(f"--start={start:.3f}")
         return command + [url]
+
+    async def set_volume(self, volume: int) -> None:
+        """Меняет громкость; ffplay/mpv не умеют на лету, поэтому перезапускаем."""
+        self.volume = max(0, min(100, int(volume)))
+        if self.url and self.is_playing():
+            position = self.elapsed()
+            was_paused = self.paused
+            await self.play(self.url, position)
+            if was_paused:
+                self.pause()
 
     async def play(self, url: str, start: float = 0.0) -> None:
         await self.stop()
