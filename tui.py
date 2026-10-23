@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
-"""Полноценный TUI-плеер MTS Music на Textual.
-
-Запуск:  python mtsmusic.py tui
-"""
+"""Mobile-style TUI player for MTS Music (Textual)."""
 
 from __future__ import annotations
 
-import asyncio
 import io
-import os
-import shutil
-import signal
-import time
-from pathlib import Path
 
 import requests
 from PIL import Image
@@ -21,62 +12,43 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.events import Click, Resize
+from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
     DataTable,
     Footer,
-    Header,
+    Input,
     ProgressBar,
     Static,
-    TabbedContent,
-    TabPane,
 )
 
+from media import (
+    load_history,
+    record_history,
+    track_album,
+    track_artist,
+    track_cover_url,
+)
 from mtsmusic import (
     USER_AGENT,
     Api,
-    album_id,
-    fetch_mix_batch,
     fmt_duration,
     force_ipv4,
     get_uid,
+    lrclib_lyrics,
+    lyrics_response,
+    lyrics_text,
     resolve_stream,
 )
+from player import MusicPlayer
 
-COVER_WIDTH = 38
-COVER_SIZE = 360
-WAVE_BATCH = 5
-
-
-# ---------------------------------------------------------------------------
-# данные треков
-# ---------------------------------------------------------------------------
+COVER_MAX = 46
+COVER_MIN = 20
+COVER_CACHE = 20
 
 
-def track_artist(track: dict) -> str:
-    return ", ".join(a.get("name", "?") for a in track.get("artists") or []) or "?"
-
-
-def track_album(track: dict) -> str:
-    albums = track.get("albums") or []
-    return (albums[0].get("title") or "—") if albums else "—"
-
-
-def track_cover_url(track: dict) -> str | None:
-    uri = track.get("coverUri")
-    if not uri:
-        albums = track.get("albums") or []
-        uri = albums[0].get("coverUri") if albums else None
-    if not uri:
-        return None
-    uri = uri.replace("%%", f"{COVER_SIZE}x{COVER_SIZE}")
-    if not uri.startswith("http"):
-        uri = "https://" + uri
-    return uri
-
-
-def cover_renderable(data: bytes, width: int = COVER_WIDTH) -> Text:
-    """Картинка в терминале: две вертикальные точки на один символ ▀."""
+def cover_renderable(data: bytes, width: int) -> Text:
     image = Image.open(io.BytesIO(data)).convert("RGB")
     rows = max(1, width // 2)
     image = image.resize((width, rows * 2), Image.Resampling.LANCZOS)
@@ -96,184 +68,393 @@ def cover_renderable(data: bytes, width: int = COVER_WIDTH) -> Text:
     return canvas
 
 
+def make_topbar(title: str, back: bool = True) -> Horizontal:
+    widgets = []
+    if back:
+        widgets.append(Button("←", id="back"))
+    widgets.append(Static(title, id="screen-title"))
+    return Horizontal(*widgets, id="screen-top")
+
+
+def track_row(track: dict) -> tuple[str, str, str, str]:
+    return (
+        track.get("title") or "?",
+        track_artist(track),
+        track_album(track),
+        fmt_duration(track.get("durationMs")),
+    )
+
+
 # ---------------------------------------------------------------------------
-# плеер
+# боковые экраны
 # ---------------------------------------------------------------------------
 
 
-class MusicPlayer:
-    """ffplay/mpv + пауза через SIGSTOP/SIGCONT."""
+class ListScreen(Screen):
+    BINDINGS = [Binding("escape", "back", "Назад")]
 
-    def __init__(self, explicit: str | None = None) -> None:
-        self.path = self._pick(explicit)
-        self.proc: asyncio.subprocess.Process | None = None
-        self.paused = False
-        self.started_at = 0.0
-        self.paused_total = 0.0
-        self.paused_at = 0.0
-        self.switching = False
+    def __init__(self, title: str, tracks: list[dict]) -> None:
+        super().__init__()
+        self.list_title = title
+        self.tracks = list(tracks)
 
-    @staticmethod
-    def _pick(explicit: str | None) -> str | None:
-        if explicit:
-            return explicit
-        env = os.environ.get("MTSMUSIC_PLAYER")
-        if env:
-            return env
-        for candidate in ("mpv", "ffplay"):
-            found = shutil.which(candidate)
-            if found:
-                return found
-        return None
+    def compose(self) -> ComposeResult:
+        yield make_topbar(self.list_title)
+        yield DataTable(id="list-table", cursor_type="row", zebra_stripes=True)
 
-    def _command(self, url: str) -> list[str]:
-        name = Path(self.path or "").name
-        if name == "ffplay":
-            return [self.path or "ffplay", "-nodisp", "-autoexit", "-loglevel", "error", url]
-        return [self.path or "mpv", "--no-video", "--really-quiet", url]
+    def on_mount(self) -> None:
+        table = self.query_one("#list-table", DataTable)
+        table.add_columns("Трек", "Исполнитель", "Альбом", "Длит.")
+        self.fill(self.tracks)
 
-    async def play(self, url: str) -> None:
-        await self.stop()
-        if not self.path:
-            raise RuntimeError("не найден mpv/ffplay")
-        self.switching = True
-        self.proc = await asyncio.create_subprocess_exec(
-            *self._command(url),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+    def fill(self, tracks: list[dict]) -> None:
+        self.tracks = tracks
+        table = self.query_one("#list-table", DataTable)
+        table.clear()
+        for track in tracks:
+            table.add_row(*track_row(track), key=str(track.get("id")))
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#back")
+    def back_pressed(self) -> None:
+        self.action_back()
+
+    @on(DataTable.RowSelected)
+    def row_selected(self, event: DataTable.RowSelected) -> None:
+        track_id = str(event.row_key.value)
+        index = next(
+            (i for i, item in enumerate(self.tracks) if str(item.get("id")) == track_id),
+            -1,
         )
-        self.paused = False
-        self.started_at = time.monotonic()
-        self.paused_total = 0.0
-        self.switching = False
+        if index >= 0:
+            self.app.play_from_list(self.tracks, index, self.list_title)
+            self.app.pop_screen()
 
-    async def stop(self) -> None:
-        self.switching = True
-        proc = self.proc
-        if proc and proc.returncode is None:
-            if self.paused:
-                try:
-                    proc.send_signal(signal.SIGCONT)
-                except ProcessLookupError:
-                    pass
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-        self.proc = None
-        self.paused = False
-        self.switching = False
 
-    def pause(self) -> None:
-        if self.proc and self.proc.returncode is None and not self.paused:
-            try:
-                self.proc.send_signal(signal.SIGSTOP)
-            except ProcessLookupError:
-                return
-            self.paused = True
-            self.paused_at = time.monotonic()
+class FavoritesScreen(Screen):
+    BINDINGS = [Binding("escape", "back", "Назад")]
 
-    def resume(self) -> None:
-        if self.proc and self.proc.returncode is None and self.paused:
-            try:
-                self.proc.send_signal(signal.SIGCONT)
-            except ProcessLookupError:
-                return
-            self.paused = False
-            self.paused_total += time.monotonic() - self.paused_at
+    def compose(self) -> ComposeResult:
+        yield make_topbar("Избранное")
+        yield Static("Загружаю…", id="screen-status")
+        yield DataTable(id="list-table", cursor_type="row", zebra_stripes=True)
 
-    def toggle_pause(self) -> bool:
-        if self.paused:
-            self.resume()
-        else:
-            self.pause()
-        return self.paused
+    def on_mount(self) -> None:
+        table = self.query_one("#list-table", DataTable)
+        table.add_columns("Трек", "Исполнитель", "Альбом", "Длит.")
+        self.load()
 
-    def is_playing(self) -> bool:
-        return bool(self.proc and self.proc.returncode is None)
+    def action_back(self) -> None:
+        self.app.pop_screen()
 
-    def elapsed(self) -> float:
-        if not self.proc:
-            return 0.0
-        now = self.paused_at if self.paused else time.monotonic()
-        return max(0.0, now - self.started_at - self.paused_total)
+    @on(Button.Pressed, "#back")
+    def back_pressed(self) -> None:
+        self.action_back()
+
+    @work(thread=True, exclusive=True, group="favorites")
+    def load(self) -> None:
+        api = self.app.api
+        if not api:
+            return
+        try:
+            uid = self.app.uid or get_uid(api)
+            payload = api.get(f"/users/{uid}/likes/tracks")
+            refs = ((payload.get("result") or {}).get("library") or {}).get("tracks") or []
+            ids = [str(ref.get("id")) for ref in refs[:300]]
+            tracks: list[dict] = []
+            for start in range(0, len(ids), 50):
+                chunk = ids[start : start + 50]
+                if not chunk:
+                    continue
+                tracks.extend(
+                    api.get("/tracks", trackIds=",".join(chunk)).get("result") or []
+                )
+            self.app.call_from_thread(self.fill, tracks)
+        except SystemExit as exc:
+            self.app.call_from_thread(self.failed, str(exc))
+
+    def fill(self, tracks: list[dict]) -> None:
+        table = self.query_one("#list-table", DataTable)
+        table.clear()
+        for track in tracks:
+            table.add_row(*track_row(track), key=str(track.get("id")))
+        self.app.favorites = tracks
+        self.query_one("#screen-status", Static).update(
+            f"{len(tracks)} трек(ов)" if tracks else "Пока пусто"
+        )
+
+    def failed(self, message: str) -> None:
+        self.query_one("#screen-status", Static).update(f"Ошибка: {message}")
+
+    @on(DataTable.RowSelected)
+    def row_selected(self, event: DataTable.RowSelected) -> None:
+        track_id = str(event.row_key.value)
+        tracks = self.app.favorites
+        index = next(
+            (i for i, item in enumerate(tracks) if str(item.get("id")) == track_id),
+            -1,
+        )
+        if index >= 0:
+            self.app.play_from_list(tracks, index, "Избранное")
+            self.app.pop_screen()
+
+
+class HistoryScreen(ListScreen):
+    def __init__(self, tracks: list[dict]) -> None:
+        super().__init__("История", tracks)
+
+
+class SearchScreen(Screen):
+    BINDINGS = [Binding("escape", "back", "Назад")]
+
+    def compose(self) -> ComposeResult:
+        yield make_topbar("Поиск")
+        with Horizontal(id="search-row"):
+            yield Input(placeholder="Исполнитель или трек…", id="search-input")
+            yield Button("Найти", id="search-go", variant="primary")
+        yield Static("", id="screen-status")
+        yield DataTable(id="list-table", cursor_type="row", zebra_stripes=True)
+
+    def on_mount(self) -> None:
+        table = self.query_one("#list-table", DataTable)
+        table.add_columns("Трек", "Исполнитель", "Альбом", "Длит.")
+        self.results: list[dict] = []
+        self.query_one("#search-input", Input).focus()
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#back")
+    def back_pressed(self) -> None:
+        self.action_back()
+
+    @on(Input.Submitted)
+    def submitted(self) -> None:
+        self.search()
+
+    @on(Button.Pressed, "#search-go")
+    def search_pressed(self) -> None:
+        self.search()
+
+    def search(self) -> None:
+        query = self.query_one("#search-input", Input).value.strip()
+        if not query:
+            return
+        self.query_one("#screen-status", Static).update("Ищу…")
+        self.do_search(query)
+
+    @work(thread=True, exclusive=True, group="search")
+    def do_search(self, query: str) -> None:
+        api = self.app.api
+        if not api:
+            return
+        try:
+            payload = api.get(
+                "/search",
+                text=query,
+                type="track",
+                page=0,
+                **{"page-size": 25},
+                nocorrect="true",
+            )
+            tracks = (((payload.get("result") or {}).get("tracks") or {}).get("results")) or []
+            self.app.call_from_thread(self.fill, tracks)
+        except SystemExit as exc:
+            self.app.call_from_thread(self.failed, str(exc))
+
+    def fill(self, tracks: list[dict]) -> None:
+        self.results = tracks
+        table = self.query_one("#list-table", DataTable)
+        table.clear()
+        for track in tracks:
+            table.add_row(*track_row(track), key=str(track.get("id")))
+        self.query_one("#screen-status", Static).update(
+            f"{len(tracks)} результат(ов)" if tracks else "Ничего не найдено"
+        )
+
+    def failed(self, message: str) -> None:
+        self.query_one("#screen-status", Static).update(f"Ошибка: {message}")
+
+    @on(DataTable.RowSelected)
+    def row_selected(self, event: DataTable.RowSelected) -> None:
+        track_id = str(event.row_key.value)
+        index = next(
+            (i for i, item in enumerate(self.results) if str(item.get("id")) == track_id),
+            -1,
+        )
+        if index >= 0:
+            self.app.play_from_list(self.results, index, "Поиск")
+            self.app.pop_screen()
+
+
+class LyricsScreen(Screen):
+    BINDINGS = [Binding("escape", "back", "Назад")]
+
+    def __init__(self, track: dict) -> None:
+        super().__init__()
+        self.track = track
+
+    def compose(self) -> ComposeResult:
+        title = self.track.get("title") or "Текст"
+        yield make_topbar(f"Текст · {title}")
+        yield Static("Загружаю текст…", id="screen-status")
+        with VerticalScroll(id="lyrics-scroll"):
+            yield Static("", id="lyrics-body")
+
+    def on_mount(self) -> None:
+        self.load()
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#back")
+    def back_pressed(self) -> None:
+        self.action_back()
+
+    @work(thread=True, exclusive=True, group="lyrics")
+    def load(self) -> None:
+        api = self.app.api
+        if not api:
+            return
+        text = ""
+        source = "MTS"
+        try:
+            response = lyrics_response(api, str(self.track.get("id")), "TEXT")
+            if response.status_code == 200:
+                text = lyrics_text(api, response)
+                if "Подключите подписку" in text:
+                    text = ""
+        except Exception:
+            text = ""
+        if not text.strip():
+            text = lrclib_lyrics(self.track, want_sync=False) or ""
+            source = "LRCLIB"
+        self.app.call_from_thread(self.fill, text, source)
+
+    def fill(self, text: str, source: str) -> None:
+        status = self.query_one("#screen-status", Static)
+        body = self.query_one("#lyrics-body", Static)
+        if not text.strip():
+            status.update("Текст не найден")
+            body.update("")
+            return
+        status.update(f"Источник: {source}")
+        body.update(Text(text))
+
+
+class MenuScreen(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "close", "Закрыть")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="menu-panel"):
+            yield Static("Меню", id="menu-title")
+            yield Button("Моя волна", id="m-wave")
+            yield Button("Избранное", id="m-favorites")
+            yield Button("История", id="m-history")
+            yield Button("Поиск", id="m-search")
+            yield Button("Текст песни", id="m-lyrics")
+            yield Static("", id="menu-spacer")
+            yield Button("Выход", id="m-quit", variant="error")
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed)
+    def pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id)
 
 
 # ---------------------------------------------------------------------------
-# приложение
+# главный экран
 # ---------------------------------------------------------------------------
 
 
 class MusicTui(App):
     TITLE = "MTS Music"
-    SUB_TITLE = "Моя волна"
 
     CSS = """
-    Screen { layout: vertical; }
+    Screen { background: $background; }
 
-    #main { height: 1fr; }
-
-    #left {
-        width: 44;
-        min-width: 44;
-        padding: 1 1 0 1;
-        border-right: solid $primary-darken-2;
+    #topbar {
+        height: 3;
+        dock: top;
+        padding: 0 1;
+        align: left middle;
+        background: $panel;
     }
+    #menu { width: 5; min-width: 5; margin: 0 1 0 0; }
+    #brand { text-style: bold; padding: 0 1; }
+    #topstatus { width: 1fr; text-align: right; content-align: right middle; color: $text-muted; }
 
+    #phone {
+        height: 1fr;
+        align: center middle;
+        padding: 1 1 0 1;
+    }
     #cover {
         width: 40;
-        height: 22;
+        height: 20;
         content-align: center middle;
         color: $text-muted;
+        margin-bottom: 1;
     }
+    #title { width: 100%; text-align: center; text-style: bold; }
+    #artist { width: 100%; text-align: center; color: $text-muted; }
+    #album { width: 100%; text-align: center; color: $text-disabled; }
+    #time { width: 100%; text-align: center; color: $text-muted; margin-top: 1; }
+    #progress { width: 44; }
+    #controls { height: 3; align: center middle; margin-top: 1; }
+    #prev, #next { width: 7; min-width: 7; }
+    #playpause { width: 13; min-width: 13; margin: 0 2; }
+    #actions { height: 3; align: center middle; }
+    #actions Button { width: 20; min-width: 20; margin: 0 1; }
 
-    #info {
-        height: auto;
-        padding: 1 0 0 0;
-    }
-
-    #progress {
-        margin: 1 0 0 0;
-    }
-
-    #time {
-        height: 1;
-        color: $text-muted;
-        text-align: right;
-    }
-
-    #right { width: 1fr; padding: 0 1; }
-
-    TabbedContent { height: 1fr; }
-    TabPane { height: 1fr; padding: 0; }
-    DataTable { height: 1fr; }
-
-    #controls {
+    #screen-top {
         height: 3;
-        align: center middle;
+        dock: top;
         padding: 0 1;
+        align: left middle;
+        background: $panel;
     }
+    #back { width: 5; min-width: 5; margin-right: 1; }
+    #screen-title { text-style: bold; width: 1fr; content-align: left middle; }
+    #screen-status { height: 1; padding: 0 1; color: $text-muted; }
+    #list-table { height: 1fr; }
+    #search-row { height: 3; padding: 0 1; }
+    #search-input { width: 1fr; }
+    #search-go { width: 12; margin-left: 1; }
+    #lyrics-scroll { height: 1fr; padding: 0 2; }
+    #lyrics-body { width: 100%; }
 
-    #controls Button {
-        margin: 0 1;
-        min-width: 10;
+    MenuScreen { align: left middle; background: $background 60%; }
+    #menu-panel {
+        width: 42;
+        height: 100%;
+        background: $surface;
+        border-right: thick $accent;
+        padding: 1 2;
     }
-
-    #like { min-width: 14; }
-    #status { width: 1fr; content-align: right middle; color: $text-muted; }
+    #menu-title { text-style: bold; padding: 0 0 1 0; }
+    #menu-panel Button { width: 100%; margin: 1 0; }
+    #menu-spacer { height: 1fr; }
     """
 
     BINDINGS = [
         Binding("space", "toggle_pause", "Пауза", show=True),
-        Binding("n", "next_track", "Следующий", show=True),
-        Binding("p", "prev_track", "Предыдущий", show=True),
-        Binding("l", "toggle_like", "В избранное", show=True),
-        Binding("f", "show_favorites", "Избранное", show=True),
-        Binding("r", "refresh_wave", "Обновить волну", show=False),
+        Binding("left", "seek_back", "−5с", show=True),
+        Binding("right", "seek_forward", "+5с", show=True),
+        Binding("t", "show_lyrics", "Текст", show=True),
+        Binding("l", "toggle_like", "Избранное", show=True),
+        Binding("m", "menu", "Меню", show=True),
         Binding("q", "quit", "Выход", show=True),
+        Binding("n", "next_track", "Следующий", show=False),
+        Binding("p", "prev_track", "Предыдущий", show=False),
+        Binding("f", "show_favorites", "Избранное", show=False),
+        Binding("w", "show_wave", "Моя волна", show=False),
+        Binding("h", "show_history", "История", show=False),
+        Binding("s", "show_search", "Поиск", show=False),
     ]
 
     def __init__(self, player: str | None = None) -> None:
@@ -285,57 +466,49 @@ class MusicTui(App):
         self.wave: list[dict] = []
         self.favorites: list[dict] = []
         self.liked_ids: set[str] = set()
+        self.history: list[dict] = load_history()
         self.queue: list[dict] = []
-        self.queue_name = "wave"
+        self.queue_name = "Моя волна"
         self.current: dict | None = None
         self.current_index = -1
         self.play_token = 0
+        self.cover_token = 0
+        self.cover_bytes: dict[str, bytes] = {}
+        self.cover_width = 40
 
     # -- разметка ---------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
-        with Horizontal(id="main"):
-            with Vertical(id="left"):
-                yield Static("Загрузка…", id="cover")
-                yield Static("", id="info")
-                yield ProgressBar(total=100, show_eta=False, id="progress")
-                yield Static("0:00 / 0:00", id="time")
-            with Vertical(id="right"):
-                with TabbedContent(id="tabs"):
-                    with TabPane("Моя волна", id="tab-wave"):
-                        yield DataTable(id="wave-table", cursor_type="row", zebra_stripes=True)
-                    with TabPane("Избранное", id="tab-fav"):
-                        yield DataTable(id="fav-table", cursor_type="row", zebra_stripes=True)
-        with Horizontal(id="controls"):
-            yield Button("⏮", id="prev", variant="default")
-            yield Button("▶", id="playpause", variant="primary")
-            yield Button("⏭", id="next", variant="default")
-            yield Button("♡ В избранное", id="like", variant="success")
-            yield Button("⟳ Волна", id="refresh", variant="default")
-            yield Static("", id="status")
+        with Horizontal(id="topbar"):
+            yield Button("☰", id="menu")
+            yield Static("MTS Music", id="brand")
+            yield Static("", id="topstatus")
+        with Vertical(id="phone"):
+            yield Static("♪", id="cover")
+            yield Static("", id="title")
+            yield Static("", id="artist")
+            yield Static("", id="album")
+            yield Static("0:00 / 0:00", id="time")
+            yield ProgressBar(total=100, show_eta=False, show_percentage=False, id="progress")
+            with Horizontal(id="controls"):
+                yield Button("⏮", id="prev")
+                yield Button("▶", id="playpause", variant="primary")
+                yield Button("⏭", id="next")
+            with Horizontal(id="actions"):
+                yield Button("Текст", id="lyrics")
+                yield Button("♡ В избранное", id="like", variant="success")
         yield Footer()
 
     def on_mount(self) -> None:
-        wave_keys = self.query_one("#wave-table", DataTable).add_columns(
-            "#", "Трек", "Исполнитель", "Альбом", "Длит.", "♥"
-        )
-        fav_keys = self.query_one("#fav-table", DataTable).add_columns(
-            "#", "Трек", "Исполнитель", "Альбом", "Длит.", "♥"
-        )
-        self.like_columns = {
-            "wave-table": wave_keys[-1],
-            "fav-table": fav_keys[-1],
-        }
         self.set_interval(0.4, self.tick)
-
+        self.apply_cover_width()
         try:
             self.api = Api()
         except SystemExit:
-            self.exit(message="Не удалось инициализировать API")
+            self.exit()
             return
         if not self.api.token:
-            self.notify("Сначала войди: python mtsmusic.py login", severity="error", timeout=10)
+            self.notify("Сначала войди: python mtsmusic.py login", severity="error", timeout=8)
             self.set_timer(3, self.exit)
             return
         self.load_initial()
@@ -343,195 +516,212 @@ class MusicTui(App):
     async def on_unmount(self) -> None:
         await self.player.stop()
 
+    # -- геометрия --------------------------------------------------------
+
+    def cover_width_for(self, width: int, height: int) -> int:
+        budget = max(8, height - 19)
+        value = min(COVER_MAX, budget * 2, max(COVER_MIN, width - 12))
+        value = max(COVER_MIN, value)
+        return value - (value % 2)
+
+    def apply_cover_width(self) -> None:
+        self.cover_width = self.cover_width_for(self.size.width, self.size.height)
+        try:
+            cover = self.query_one("#cover", Static)
+        except Exception:
+            return
+        cover.styles.width = self.cover_width
+        cover.styles.height = max(4, self.cover_width // 2)
+
+    def on_resize(self, event: Resize) -> None:
+        width = self.cover_width_for(event.size.width, event.size.height)
+        if width == self.cover_width:
+            return
+        self.cover_width = width
+        try:
+            cover = self.query_one("#cover", Static)
+            cover.styles.width = width
+            cover.styles.height = max(4, width // 2)
+        except Exception:
+            return
+        url = track_cover_url(self.current) if self.current else None
+        if url and url in self.cover_bytes:
+            self.show_cover(url)
+
     # -- загрузка ---------------------------------------------------------
 
     @work(thread=True, exclusive=True)
     def load_initial(self) -> None:
-        assert self.api
+        api = self.api
+        if not api:
+            return
         try:
-            self.uid = get_uid(self.api)
-            batch = fetch_mix_batch(self.api)
+            self.uid = get_uid(api)
+            from mtsmusic import fetch_mix_batch
+
+            batch = fetch_mix_batch(api)
             wave = [
                 item["track"]
                 for item in (batch.get("sequence") or [])
                 if item.get("type") == "track" and item.get("track")
             ]
-            likes = self.api.get(f"/users/{self.uid}/likes/tracks")
-            refs = ((likes.get("result") or {}).get("library") or {}).get("tracks") or []
-            ids = [str(ref.get("id")) for ref in refs]
-            favorites: list[dict] = []
-            for start in range(0, len(ids), 50):
-                chunk = ids[start : start + 50]
-                if not chunk:
-                    continue
-                favorites.extend(
-                    self.api.get("/tracks", trackIds=",".join(chunk)).get("result") or []
-                )
-            self.call_from_thread(self.apply_initial, wave, favorites)
+            payload = api.get(f"/users/{self.uid}/likes/tracks")
+            refs = ((payload.get("result") or {}).get("library") or {}).get("tracks") or []
+            liked = {str(ref.get("id")) for ref in refs}
+            self.call_from_thread(self.apply_initial, wave, liked)
         except SystemExit as exc:
             self.call_from_thread(self.notify, f"Ошибка загрузки: {exc}", severity="error")
         except requests.RequestException as exc:
             self.call_from_thread(self.notify, f"Сеть недоступна: {exc}", severity="error")
 
-    def apply_initial(self, wave: list[dict], favorites: list[dict]) -> None:
+    def apply_initial(self, wave: list[dict], liked: set[str]) -> None:
         self.wave = wave
-        self.favorites = favorites
-        self.liked_ids = {str(track.get("id")) for track in favorites}
-        self.fill_table(self.query_one("#wave-table", DataTable), self.wave)
-        self.fill_table(self.query_one("#fav-table", DataTable), self.favorites)
-        self.set_status(f"Волна: {len(self.wave)} · избранное: {len(self.favorites)}")
+        self.liked_ids = liked
+        self.set_topstatus(f"Волна · {len(self.wave)} · ♥ {len(self.liked_ids)}")
         if self.wave:
-            self.select_first("#wave-table")
             self.current = self.wave[0]
             self.current_index = 0
             self.queue = self.wave
-            self.queue_name = "wave"
-            self.update_info()
+            self.queue_name = "Моя волна"
+            self.update_now_playing()
             self.load_cover(self.wave[0])
 
-    def fill_table(self, table: DataTable, tracks: list[dict]) -> None:
-        table.clear()
-        for index, track in enumerate(tracks, 1):
-            heart = "♥" if str(track.get("id")) in self.liked_ids else ""
-            table.add_row(
-                str(index),
-                track.get("title") or "?",
-                track_artist(track),
-                track_album(track),
-                fmt_duration(track.get("durationMs")),
-                heart,
-                key=str(track.get("id")),
-            )
+    def set_topstatus(self, text: str) -> None:
+        self.query_one("#topstatus", Static).update(text)
 
-    def add_wave_tracks(self, tracks: list[dict]) -> None:
-        table = self.query_one("#wave-table", DataTable)
-        known = {str(track.get("id")) for track in self.wave}
-        added = 0
-        for track in tracks:
-            track_id = str(track.get("id"))
-            if not track_id or track_id in known:
-                continue
-            known.add(track_id)
-            self.wave.append(track)
-            heart = "♥" if track_id in self.liked_ids else ""
-            table.add_row(
-                str(len(self.wave)),
-                track.get("title") or "?",
-                track_artist(track),
-                track_album(track),
-                fmt_duration(track.get("durationMs")),
-                heart,
-                key=track_id,
-            )
-            added += 1
-        if added:
-            self.set_status(f"Волна: {len(self.wave)} · избранное: {len(self.favorites)}")
+    # -- now playing ------------------------------------------------------
 
-    def select_first(self, table_id: str) -> None:
-        table = self.query_one(table_id, DataTable)
-        if table.row_count:
-            table.move_cursor(row=0)
-
-    # -- информация о треке ----------------------------------------------
-
-    def update_info(self) -> None:
+    def update_now_playing(self) -> None:
         track = self.current
-        info = self.query_one("#info", Static)
         if not track:
-            info.update(Text("Ничего не играет", style="dim"))
             return
-
         track_id = str(track.get("id"))
         liked = track_id in self.liked_ids
-        lines = Text()
-        lines.append(track.get("title") or "?", style="bold")
-        lines.append("\n")
-        lines.append(track_artist(track), style="italic")
-        lines.append("\n")
-        lines.append(track_album(track), style="dim")
-        lines.append("\n")
-        lines.append(f"{fmt_duration(track.get('durationMs'))}  ")
-        lines.append("♥ в избранном" if liked else "♡ не в избранном", style="red" if liked else "dim")
 
-        info.update(lines)
-        button = self.query_one("#like", Button)
-        button.label = "♥ Убрать" if liked else "♡ В избранное"
-        button.variant = "warning" if liked else "success"
+        self.query_one("#title", Static).update(Text(track.get("title") or "?"))
+        self.query_one("#artist", Static).update(Text(track_artist(track)))
+        self.query_one("#album", Static).update(Text(track_album(track)))
+        self.update_like_button(liked)
         self.update_play_button()
+        self.update_time()
+        self.sub_title = track.get("title") or ""
+
+    def update_like_button(self, liked: bool | None = None) -> None:
+        if liked is None:
+            liked = bool(self.current and str(self.current.get("id")) in self.liked_ids)
+        button = self.query_one("#like", Button)
+        button.label = "♥ В избранном" if liked else "♡ В избранное"
+        button.variant = "warning" if liked else "success"
 
     def update_play_button(self) -> None:
-        button = self.query_one("#playpause", Button)
-        button.label = "⏸" if self.player.paused else "▶"
+        self.query_one("#playpause", Button).label = "⏸" if self.player.paused else "▶"
 
     def update_time(self) -> None:
         duration = (self.current or {}).get("durationMs") or 0
         elapsed = min(self.player.elapsed(), duration / 1000 if duration else 0)
         bar = self.query_one("#progress", ProgressBar)
         bar.update(total=max(duration / 1000, 1), progress=elapsed)
-        label = self.query_one("#time", Static)
-        label.update(f"{fmt_duration(int(elapsed * 1000))} / {fmt_duration(duration)}")
-
-    def set_status(self, text: str) -> None:
-        self.query_one("#status", Static).update(text)
+        self.query_one("#time", Static).update(
+            f"{fmt_duration(int(elapsed * 1000))} / {fmt_duration(duration)}"
+        )
 
     # -- обложка ----------------------------------------------------------
 
-    @work(thread=True, exclusive=True, group="cover")
-    def load_cover(self, track: dict) -> None:
-        url = track_cover_url(track)
-        if not url:
-            self.call_from_thread(self.show_placeholder_cover)
+    def show_placeholder_cover(self, text: str = "♪") -> None:
+        self.query_one("#cover", Static).update(Text(text, justify="center"))
+
+    def show_cover(self, url: str) -> None:
+        data = self.cover_bytes.get(url)
+        if not data:
+            self.show_placeholder_cover()
             return
         try:
+            self.query_one("#cover", Static).update(cover_renderable(data, self.cover_width))
+        except (OSError, ValueError):
+            self.show_placeholder_cover()
+
+    def load_cover(self, track: dict) -> None:
+        self.cover_token += 1
+        token = self.cover_token
+        url = track_cover_url(track)
+        if not url:
+            self.show_placeholder_cover()
+            return
+        if url in self.cover_bytes:
+            self.show_cover(url)
+            return
+        self.show_placeholder_cover("загрузка…")
+        self.fetch_cover(token, url)
+
+    @work(thread=True, exclusive=True, group="cover")
+    def fetch_cover(self, token: int, url: str) -> None:
+        try:
             force_ipv4()
-            response = requests.get(
-                url, headers={"User-Agent": USER_AGENT}, timeout=20
-            )
+            response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=20)
             response.raise_for_status()
-            renderable = cover_renderable(response.content)
-            self.call_from_thread(self.show_cover, renderable)
-        except (requests.RequestException, OSError, ValueError):
-            self.call_from_thread(self.show_placeholder_cover)
+            data = response.content
+        except (requests.RequestException, OSError):
+            return
+        self.call_from_thread(self.apply_cover, token, url, data)
 
-    def show_cover(self, renderable: Text) -> None:
-        self.query_one("#cover", Static).update(renderable)
-
-    def show_placeholder_cover(self) -> None:
-        self.query_one("#cover", Static).update("♪\n\nнет обложки")
+    def apply_cover(self, token: int, url: str, data: bytes) -> None:
+        if token != self.cover_token:
+            return
+        if len(self.cover_bytes) >= COVER_CACHE:
+            self.cover_bytes.pop(next(iter(self.cover_bytes)))
+        self.cover_bytes[url] = data
+        self.show_cover(url)
 
     # -- воспроизведение --------------------------------------------------
 
-    def play_track(self, track: dict, queue: list[dict] | None = None, index: int | None = None) -> None:
+    def play_from_list(self, tracks: list[dict], index: int, name: str) -> None:
+        if not (0 <= index < len(tracks)):
+            return
+        self.queue_name = name
+        self.set_topstatus(name)
+        self.play_track(tracks[index], tracks, index)
+
+    def play_track(
+        self,
+        track: dict,
+        queue: list[dict] | None = None,
+        index: int | None = None,
+    ) -> None:
         if queue is not None:
             self.queue = queue
-        if index is not None:
-            self.current_index = index
-        else:
-            self.current_index = next(
-                (i for i, item in enumerate(self.queue) if str(item.get("id")) == str(track.get("id"))),
+        if index is None:
+            index = next(
+                (
+                    i
+                    for i, item in enumerate(self.queue)
+                    if str(item.get("id")) == str(track.get("id"))
+                ),
                 -1,
             )
         self.current = track
+        self.current_index = index
         self.play_token += 1
         token = self.play_token
-        self.update_info()
-        self.update_time()
+        self.update_now_playing()
         self.load_cover(track)
-        self.set_status("Загружаю поток…")
+        self.set_topstatus(f"{self.queue_name} · загрузка…")
+
         self.fetch_stream(token, track)
 
     @work(thread=True, exclusive=False, group="stream")
     def fetch_stream(self, token: int, track: dict) -> None:
-        assert self.api
+        api = self.api
+        if not api:
+            return
         try:
-            url, item = resolve_stream(self.api, str(track.get("id")))
+            url, item = resolve_stream(api, str(track.get("id")))
         except SystemExit as exc:
             self.call_from_thread(
                 self.notify, f"Не удалось открыть трек: {exc}", severity="error"
             )
             return
         self.call_from_thread(
-            self.start_playback, token, track, url, item.get("preview", False)
+            self.start_playback, token, track, url, bool(item.get("preview"))
         )
 
     def start_playback(self, token: int, track: dict, url: str, preview: bool) -> None:
@@ -545,13 +735,15 @@ class MusicTui(App):
         except (RuntimeError, OSError) as exc:
             self.notify(str(exc), severity="error")
             return
+        self.history = record_history(track)
         self.update_play_button()
-        self.set_status(
-            ("preview · " if preview else "")
-            + f"Играет: {track_artist(track)} — {track.get('title')}"
+        self.set_topstatus(
+            ("preview · " if preview else "") + (track.get("title") or "")
         )
 
     def action_toggle_pause(self) -> None:
+        if not self.current:
+            return
         if not self.player.is_playing():
             self.action_play_current()
             return
@@ -560,9 +752,7 @@ class MusicTui(App):
 
     def action_play_current(self) -> None:
         if self.current:
-            queue = self.queue or self.wave
-            index = self.current_index if 0 <= self.current_index < len(queue) else None
-            self.play_track(self.current, queue, index)
+            self.play_track(self.current, self.queue or self.wave, self.current_index)
 
     def try_next(self, direction: int) -> None:
         queue = self.queue or self.wave
@@ -570,7 +760,7 @@ class MusicTui(App):
             return
         index = self.current_index + direction
         if index >= len(queue):
-            if self.queue_name == "wave":
+            if self.queue_name == "Моя волна":
                 self.load_more_wave(then_play=index)
                 return
             index = 0
@@ -585,26 +775,49 @@ class MusicTui(App):
     def action_prev_track(self) -> None:
         self.try_next(-1)
 
-    def action_show_favorites(self) -> None:
-        tabs = self.query_one("#tabs", TabbedContent)
-        tabs.active = "tab-fav"
-        table = self.query_one("#fav-table", DataTable)
-        if table.row_count:
-            table.focus()
+    def action_seek_back(self) -> None:
+        self.seek(-5)
 
-    def action_refresh_wave(self) -> None:
-        self.load_more_wave(refresh=True)
+    def action_seek_forward(self) -> None:
+        self.seek(5)
+
+    def seek(self, delta: float) -> None:
+        if not self.current or not self.player.is_playing():
+            return
+        duration = (self.current.get("durationMs") or 0) / 1000
+        self.run_worker(self._seek(delta, duration), group="seek", exclusive=True)
+
+    async def _seek(self, delta: float, duration: float) -> None:
+        await self.player.seek(delta, duration)
+        self.update_time()
+
+    async def seek_fraction(self, fraction: float) -> None:
+        if not self.current or not self.player.is_playing():
+            return
+        duration = (self.current.get("durationMs") or 0) / 1000
+        if duration <= 0:
+            return
+        target = max(0.0, min(duration - 1, duration * fraction))
+        await self.player.seek(target - self.player.elapsed(), duration)
+        self.update_time()
+
+    @on(Click, "#progress")
+    def progress_clicked(self, event: Click) -> None:
+        width = event.widget.size.width or 1
+        self.run_worker(self.seek_fraction(event.x / width), group="seek")
+
+    # -- волна ------------------------------------------------------------
 
     @work(thread=True, exclusive=True, group="wave")
-    def load_more_wave(self, then_play: int | None = None, refresh: bool = False) -> None:
-        assert self.api
+    def load_more_wave(self, then_play: int | None = None) -> None:
+        api = self.api
+        if not api:
+            return
         try:
-            if refresh:
-                queue = []
-            else:
-                ids = [str(track.get("id")) for track in self.wave[-WAVE_BATCH:]]
-                queue = ids if ids else []
-            batch = fetch_mix_batch(self.api, queue or None)
+            from mtsmusic import fetch_mix_batch
+
+            ids = [str(track.get("id")) for track in self.wave[-5:]]
+            batch = fetch_mix_batch(api, ids or None)
             tracks = [
                 item["track"]
                 for item in (batch.get("sequence") or [])
@@ -615,37 +828,43 @@ class MusicTui(App):
             self.call_from_thread(self.notify, f"Ошибка волны: {exc}", severity="error")
 
     def apply_more_wave(self, tracks: list[dict], then_play: int | None) -> None:
-        if not tracks:
-            self.notify("Волна не вернула новых треков", severity="warning")
-            return
-        self.add_wave_tracks(tracks)
+        known = {str(track.get("id")) for track in self.wave}
+        added = [track for track in tracks if str(track.get("id")) not in known]
+        self.wave.extend(added)
+        self.set_topstatus(f"Волна · {len(self.wave)} · ♥ {len(self.liked_ids)}")
         if then_play is not None and then_play < len(self.queue):
             self.play_track(self.queue[then_play], self.queue, then_play)
+        elif then_play is not None and added:
+            self.queue = self.wave
+            self.current_index = len(self.wave) - len(added)
+            self.play_track(self.wave[self.current_index], self.wave, self.current_index)
 
     # -- избранное --------------------------------------------------------
 
     def action_toggle_like(self) -> None:
-        if not self.current:
-            return
-        self.toggle_like(self.current)
+        if self.current:
+            self.toggle_like(self.current)
 
     @work(thread=True, exclusive=True, group="like")
     def toggle_like(self, track: dict) -> None:
-        assert self.api
+        api = self.api
+        if not api:
+            return
         track_id = str(track.get("id"))
-        album = album_id(track)
+        albums = track.get("albums") or []
+        album = str(albums[0].get("id")) if albums else ""
         if not album:
             self.call_from_thread(self.notify, "У трека нет альбома", severity="error")
             return
         liked = track_id in self.liked_ids
         try:
             if liked:
-                self.api.post(
+                api.post(
                     f"/users/{self.uid}/likes/tracks/remove",
                     **{"track-ids": f"{track_id}:{album}"},
                 )
             else:
-                self.api.post(
+                api.post(
                     f"/users/{self.uid}/likes/tracks/add",
                     **{"track-id": f"{track_id}:{album}"},
                 )
@@ -658,59 +877,61 @@ class MusicTui(App):
         track_id = str(track.get("id"))
         if liked:
             self.liked_ids.add(track_id)
-            if not any(str(item.get("id")) == track_id for item in self.favorites):
-                self.favorites.insert(0, track)
         else:
             self.liked_ids.discard(track_id)
-            self.favorites = [
-                item for item in self.favorites if str(item.get("id")) != track_id
-            ]
+        if self.current and str(self.current.get("id")) == track_id:
+            self.update_like_button(liked)
+        self.set_topstatus(f"{self.queue_name} · ♥ {len(self.liked_ids)}")
+        self.notify("♥ Добавлено" if liked else "♡ Убрано", timeout=2)
 
-        wave_table = self.query_one("#wave-table", DataTable)
-        if track_id in {str(item.get("id")) for item in self.wave}:
-            try:
-                wave_table.update_cell(
-                    track_id,
-                    self.like_columns["wave-table"],
-                    "♥" if liked else "",
-                )
-            except Exception:
-                pass
-        self.fill_table(self.query_one("#fav-table", DataTable), self.favorites)
-        self.update_info()
-        self.notify(
-            "♥ Добавлено в избранное" if liked else "♡ Убрано из избранного",
-            timeout=2,
-        )
-        self.set_status(f"Волна: {len(self.wave)} · избранное: {len(self.favorites)}")
+    # -- меню и экраны ----------------------------------------------------
+
+    def action_menu(self) -> None:
+        self.push_screen(MenuScreen(), self.menu_result)
+
+    def menu_result(self, action: str | None) -> None:
+        if action == "m-wave":
+            self.push_screen(ListScreen("Моя волна", self.wave))
+        elif action == "m-favorites":
+            self.push_screen(FavoritesScreen())
+        elif action == "m-history":
+            self.push_screen(HistoryScreen(self.history))
+        elif action == "m-search":
+            self.push_screen(SearchScreen())
+        elif action == "m-lyrics":
+            self.action_show_lyrics()
+        elif action == "m-quit":
+            self.exit()
+
+    def action_show_favorites(self) -> None:
+        self.push_screen(FavoritesScreen())
+
+    def action_show_wave(self) -> None:
+        self.push_screen(ListScreen("Моя волна", self.wave))
+
+    def action_show_history(self) -> None:
+        self.push_screen(HistoryScreen(self.history))
+
+    def action_show_search(self) -> None:
+        self.push_screen(SearchScreen())
+
+    def action_show_lyrics(self) -> None:
+        if self.current:
+            self.push_screen(LyricsScreen(self.current))
+        else:
+            self.notify("Сначала выбери трек", severity="warning")
 
     # -- события ----------------------------------------------------------
-
-    @on(DataTable.RowSelected)
-    def row_selected(self, event: DataTable.RowSelected) -> None:
-        table = event.data_table
-        track_id = str(event.row_key.value)
-        if table.id == "wave-table":
-            queue, name = self.wave, "wave"
-        else:
-            queue, name = self.favorites, "fav"
-        index = next(
-            (i for i, track in enumerate(queue) if str(track.get("id")) == track_id),
-            -1,
-        )
-        if index < 0:
-            return
-        self.queue_name = name
-        self.play_track(queue[index], queue, index)
 
     @on(Button.Pressed)
     def button_pressed(self, event: Button.Pressed) -> None:
         handlers = {
+            "menu": self.action_menu,
             "prev": self.action_prev_track,
             "playpause": self.action_toggle_pause,
             "next": self.action_next_track,
+            "lyrics": self.action_show_lyrics,
             "like": self.action_toggle_like,
-            "refresh": self.action_refresh_wave,
         }
         handler = handlers.get(event.button.id or "")
         if handler:
@@ -727,7 +948,6 @@ class MusicTui(App):
         if self.player.switching:
             return
         if proc.returncode is not None:
-            # Трек закончился — сразу переходим к следующему.
             self.player.proc = None
             self.action_next_track()
             return
